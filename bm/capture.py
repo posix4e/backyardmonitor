@@ -34,7 +34,9 @@ class VideoCaptureWorker:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="VideoCapture", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run, name="VideoCapture", daemon=True
+        )
         self._thread.start()
 
     def stop(self) -> None:
@@ -74,8 +76,9 @@ class VideoCaptureWorker:
 
     @staticmethod
     def encode_jpeg(frame: np.ndarray, quality: int = 80) -> bytes:
-        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+        ok, buf = cv2.imencode(
+            ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
+        )
         if not ok:
             raise RuntimeError("Failed to encode JPEG")
         return bytes(buf)
-

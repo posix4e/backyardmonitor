@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Response
+import logging
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -32,6 +33,8 @@ class AppState:
         self.analysis: Optional[AnalysisWorker] = None
         # in-memory spot image signature tracker: { spot_id: {sig: str, since: float} }
         self.spot_tracker: dict[str, dict[str, float | str]] = {}
+        # Comparison filtering baseline (events older than this ts are ignored for prev/compare)
+        self.compare_baseline_ts: float = 0.0
 
     def ensure_capture(self) -> None:
         if not self.settings.rtsp_url:
@@ -60,17 +63,39 @@ def create_app() -> FastAPI:
         # Start background analysis task writer if enabled
         if settings.analysis_enabled:
             worker = AnalysisWorker(state.data_dir, settings.analysis_interval_sec)
-            worker.get_latest_frame = (lambda: state.capture.latest() if state.capture else None)
+            worker.get_latest_frame = lambda: (
+                state.capture.latest() if state.capture else None
+            )
+
             def _get_spots():
                 z = load_zones(state.zones_path)
-                return [{"id": s.id, "name": s.name, "polygon": s.polygon} for s in z.spots]
+                return [
+                    {"id": s.id, "name": s.name, "polygon": s.polygon} for s in z.spots
+                ]
+
             worker.get_spots = _get_spots
             worker.start()
             state.analysis = worker
+        # Background retention sweep (hourly)
+        try:
+            import threading, time as _t
+
+            def _retention_loop():
+                while True:
+                    try:
+                        apply_retention_sweep()
+                    except Exception:
+                        pass
+                    _t.sleep(3600)
+
+            threading.Thread(target=_retention_loop, daemon=True).start()
+        except Exception:
+            pass
 
     @app.get("/", response_class=HTMLResponse)
-    async def index() -> str:
-        return INDEX_HTML
+    async def index():
+        path = Path(__file__).parent / "static" / "index.html"
+        return path.read_text(encoding="utf-8")
 
     # Single-page app; legacy routes removed
 
@@ -92,6 +117,7 @@ def create_app() -> FastAPI:
     async def api_spot_stats():
         import numpy as np
         import cv2
+
         zones = load_zones(state.zones_path)
         now = time.time()
         latest = state.capture.latest() if state.capture else None
@@ -105,88 +131,269 @@ def create_app() -> FastAPI:
             x2, y2 = int(max(xs)), int(max(ys))
             sig = None
             if frame is not None and x2 > x1 and y2 > y1:
-                crop = frame[max(0,y1):min(frame.shape[0],y2), max(0,x1):min(frame.shape[1],x2)]
+                crop = frame[
+                    max(0, y1) : min(frame.shape[0], y2),
+                    max(0, x1) : min(frame.shape[1], x2),
+                ]
                 if crop.size > 0:
-                    # downsample grayscale to 8x8 and threshold to get a simple hash
+                    # DCT-based pHash (64 bits) with slight blur for robustness
                     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                    small = cv2.resize(gray, (8, 8), interpolation=cv2.INTER_AREA)
-                    mean = float(np.mean(small))
-                    bits = (small > mean).astype(np.uint8)
-                    sig = ''.join('1' if b else '0' for b in bits.flatten())
+                    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+                    small = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA)
+                    smallf = small.astype(np.float32)
+                    dct = cv2.dct(smallf)
+                    dct_low = dct[:8, :8].copy()
+                    vals = dct_low.flatten()
+                    vals_no_dc = vals[1:]
+                    median = float(np.median(vals_no_dc))
+                    bits = (vals > median).astype(np.uint8)
+                    sig = "".join("1" if b else "0" for b in bits)
             rec = state.spot_tracker.get(s.id)
+
+            def _hamming(a: str | None, b: str | None) -> int:
+                if not a or not b or len(a) != len(b):
+                    return 999
+                return sum(1 for i in range(len(a)) if a[i] != b[i])
+
             if sig is not None:
                 if not rec:
-                    state.spot_tracker[s.id] = { 'sig': sig, 'since': now }
+                    state.spot_tracker[s.id] = {"sig": sig, "since": now}
                     rec = state.spot_tracker[s.id]
-                elif rec.get('sig') != sig:
-                    # Emit a spot_change event for previous state duration and save images
-                    prev_sig = rec.get('sig')
-                    prev_since = float(rec.get('since') or now)
-                    duration_prev = max(0.0, now - prev_since)
-                    try:
-                        import cv2, os
-                        ts_ms = int(now * 1000)
-                        base = f"evt_{ts_ms}_{s.id}"
-                        full_path = state.frames_dir / f"{base}_full.jpg"
-                        crop_path = state.frames_dir / f"{base}_crop.jpg"
-                        thumb_path = state.frames_dir / f"{base}_thumb.jpg"
-                        # Save full frame
+                elif rec.get("sig") != sig:
+                    prev_sig = str(rec.get("sig") or "")
+                    prev_since = float(rec.get("since") or now)
+                    # hysteresis and threshold (per-spot overrides take precedence)
+                    spot_min_bits = getattr(s, "min_bits", None)
+                    spot_stable_ms = getattr(s, "stable_ms", None)
+                    min_bits = int(
+                        spot_min_bits
+                        if spot_min_bits is not None
+                        else (state.settings.phash_min_bits or 0)
+                    )
+                    stable_ms = int(
+                        spot_stable_ms
+                        if spot_stable_ms is not None
+                        else (state.settings.phash_stable_ms or 0)
+                    )
+                    cand_sig = rec.get("cand_sig")
+                    cand_since = float(rec.get("cand_since") or 0)
+                    if cand_sig != sig:
+                        rec["cand_sig"] = sig
+                        rec["cand_since"] = now
                         try:
-                            cv2.imwrite(str(full_path), frame)
+                            logging.getLogger("uvicorn.error").debug(
+                                f"spot={s.id} candidate start delta={_hamming(prev_sig, sig)} bits"
+                            )
                         except Exception:
                             pass
-                        # Save spot crop and a small thumbnail
-                        if 'crop' in locals() and crop is not None and crop.size > 0:
+                    else:
+                        stable = (
+                            ((now - cand_since) * 1000.0) >= stable_ms
+                            if stable_ms > 0
+                            else True
+                        )
+                        delta_bits = _hamming(prev_sig, sig)
+                        if not stable:
                             try:
-                                cv2.imwrite(str(crop_path), crop)
-                                # thumbnail 240px width preserving aspect
-                                h_c, w_c = crop.shape[:2]
-                                if w_c > 0 and h_c > 0:
-                                    new_w = 240
-                                    new_h = max(1, int(h_c * (new_w / w_c)))
-                                    thumb = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                                    cv2.imwrite(str(thumb_path), thumb)
+                                logging.getLogger("uvicorn.error").info(
+                                    f"spot={s.id} status=unstable delta={delta_bits} elapsed_ms={(now - cand_since)*1000:.0f} need_ms={stable_ms}"
+                                )
                             except Exception:
                                 pass
-                        meta = {
-                            'spot_id': s.id,
-                            'prev_sig': prev_sig,
-                            'new_sig': sig,
-                            'duration_prev': duration_prev,
-                            'image_full': full_path.name,
-                            'image_crop': crop_path.name,
-                            'image_thumb': thumb_path.name,
-                        }
-                        state.events.add('spot_change', meta)
+                        if stable and delta_bits >= min_bits:
+                            duration_prev = max(0.0, now - prev_since)
+                            try:
+                                import cv2, os
+
+                                ts_ms = int(now * 1000)
+                                base = f"evt_{ts_ms}_{s.id}"
+                                full_path = state.frames_dir / f"{base}_full.jpg"
+                                crop_path = state.frames_dir / f"{base}_crop.jpg"
+                                thumb_path = state.frames_dir / f"{base}_thumb.jpg"
+                                params = [
+                                    int(cv2.IMWRITE_JPEG_QUALITY),
+                                    int(state.settings.jpeg_quality or 80),
+                                ]
+                                # Save configured outputs (thumbs-only by default)
+                                if state.settings.store_full_frames:
+                                    try:
+                                        cv2.imwrite(str(full_path), frame, params)
+                                    except Exception:
+                                        pass
+                                if (
+                                    "crop" in locals()
+                                    and crop is not None
+                                    and crop.size > 0
+                                ):
+                                    if state.settings.store_crops:
+                                        try:
+                                            cv2.imwrite(str(crop_path), crop, params)
+                                        except Exception:
+                                            pass
+                                    if state.settings.store_thumbs:
+                                        try:
+                                            h_c, w_c = crop.shape[:2]
+                                            if w_c > 0 and h_c > 0:
+                                                new_w = 240
+                                                new_h = max(1, int(h_c * (new_w / w_c)))
+                                                thumb = cv2.resize(
+                                                    crop,
+                                                    (new_w, new_h),
+                                                    interpolation=cv2.INTER_AREA,
+                                                )
+                                                cv2.imwrite(
+                                                    str(thumb_path), thumb, params
+                                                )
+                                        except Exception:
+                                            pass
+                                meta = {
+                                    "spot_id": s.id,
+                                    "prev_sig": prev_sig,
+                                    "new_sig": sig,
+                                    "delta_bits": _hamming(prev_sig, sig),
+                                    "duration_prev": duration_prev,
+                                }
+                                # Only include paths that actually exist and were configured
+                                if (
+                                    state.settings.store_full_frames
+                                    and full_path.exists()
+                                ):
+                                    meta["image_full"] = full_path.name
+                                if state.settings.store_crops and crop_path.exists():
+                                    meta["image_crop"] = crop_path.name
+                                if state.settings.store_thumbs and thumb_path.exists():
+                                    meta["image_thumb"] = thumb_path.name
+                                state.events.add("spot_change", meta)
+                                try:
+                                    logging.getLogger("uvicorn.error").info(
+                                        f"spot={s.id} status=accept delta={delta_bits} duration_prev={duration_prev:.1f}s"
+                                    )
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                            state.spot_tracker[s.id] = {"sig": sig, "since": now}
+                            rec = state.spot_tracker[s.id]
+                        elif stable and delta_bits < min_bits:
+                            try:
+                                logging.getLogger("uvicorn.error").debug(
+                                    f"spot={s.id} status=reject delta={delta_bits} min_bits={min_bits}"
+                                )
+                            except Exception:
+                                pass
+            since = rec.get("since") if rec else None
+            duration = (now - float(since)) if since else None
+            stats.append(
+                {
+                    "id": s.id,
+                    "name": s.name or s.id,
+                    "x1": x1,
+                    "y1": y1,
+                    "x2": x2,
+                    "y2": y2,
+                    "w": max(0, x2 - x1),
+                    "h": max(0, y2 - y1),
+                    "since": since,
+                    "duration_sec": duration,
+                    "sig": sig,
+                }
+            )
+        return {"spots": stats, "ts": now}
+
+    def apply_retention_sweep():
+        import time
+
+        # Time-based retention
+        days = max(0, int(state.settings.retain_days or 0))
+        now = time.time()
+        deleted = 0
+        if days > 0:
+            cutoff = now - days * 86400
+            old = state.events.older_than(cutoff, limit=5000)
+            for e in old:
+                meta = e.get("meta") or {}
+                for k in ("image_full", "image_crop", "image_thumb"):
+                    name = meta.get(k)
+                    if name:
+                        p = state.frames_dir / str(name)
+                        if p.exists():
+                            try:
+                                p.unlink()
+                            except Exception:
+                                pass
+                if state.events.delete(int(e["id"])):
+                    deleted += 1
+        # Event count cap
+        total = state.events.count()
+        max_e = max(100, int(state.settings.max_events or 5000))
+        if total > max_e:
+            overflow = total - max_e
+            olds = state.events.oldest(overflow)
+            for e in olds:
+                meta = e.get("meta") or {}
+                for k in ("image_full", "image_crop", "image_thumb"):
+                    name = meta.get(k)
+                    if name:
+                        p = state.frames_dir / str(name)
+                        if p.exists():
+                            try:
+                                p.unlink()
+                            except Exception:
+                                pass
+                if state.events.delete(int(e["id"])):
+                    deleted += 1
+        # Soft storage cap (best-effort)
+        try:
+            cap = int(state.settings.max_storage_gb or 10) * (1024**3)
+            total_bytes = 0
+            if state.frames_dir.exists():
+                for p in state.frames_dir.glob("*.jpg"):
+                    try:
+                        total_bytes += p.stat().st_size
                     except Exception:
                         pass
-                    state.spot_tracker[s.id] = { 'sig': sig, 'since': now }
-                    rec = state.spot_tracker[s.id]
-            since = rec.get('since') if rec else None
-            duration = (now - float(since)) if since else None
-            stats.append({
-                'id': s.id,
-                'name': s.name or s.id,
-                'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
-                'w': max(0, x2 - x1), 'h': max(0, y2 - y1),
-                'since': since,
-                'duration_sec': duration,
-            })
-        return { 'spots': stats, 'ts': now }
+            while total_bytes > cap:
+                batch = state.events.oldest(100)
+                if not batch:
+                    break
+                for e in batch:
+                    meta = e.get("meta") or {}
+                    for k in ("image_full", "image_crop", "image_thumb"):
+                        name = meta.get(k)
+                        if name:
+                            p = state.frames_dir / str(name)
+                            if p.exists():
+                                try:
+                                    sz = p.stat().st_size
+                                    p.unlink()
+                                    total_bytes -= sz
+                                except Exception:
+                                    pass
+                    if state.events.delete(int(e["id"])):
+                        deleted += 1
+                if len(batch) < 100:
+                    break
+        except Exception:
+            pass
+        return deleted
 
     @app.get("/api/event_image")
     async def event_image(id: int, kind: str = "thumb") -> Response:
         ev = state.events.get(int(id))
         if not ev:
             raise HTTPException(404, "Event not found")
-        meta = ev.get('meta') or {}
+        meta = ev.get("meta") or {}
         name = None
-        if kind == 'full':
-            name = meta.get('image_full')
-        elif kind == 'crop':
-            name = meta.get('image_crop')
+        if kind == "full":
+            name = meta.get("image_full")
+        elif kind == "crop":
+            name = meta.get("image_crop")
         else:
-            name = meta.get('image_thumb') or meta.get('image_crop') or meta.get('image_full')
+            name = (
+                meta.get("image_thumb")
+                or meta.get("image_crop")
+                or meta.get("image_full")
+            )
         if not name:
             raise HTTPException(404, "No image for event")
         path = state.frames_dir / name
@@ -195,8 +402,230 @@ def create_app() -> FastAPI:
         data = path.read_bytes()
         return Response(content=data, media_type="image/jpeg")
 
-    @app.post("/api/control", response_class=JSONResponse)
-    async def api_control(action: str):
+    # Generic events API for read/edit/delete
+    @app.get("/api/events", response_class=JSONResponse)
+    async def list_events(limit: int = 100):
+        return {"items": state.events.recent(int(limit))}
+
+    @app.get("/api/events/{event_id}", response_class=JSONResponse)
+    async def get_event(event_id: int):
+        ev = state.events.get(int(event_id))
+        if not ev:
+            raise HTTPException(404, "Event not found")
+        return ev
+
+    @app.post("/api/events/{event_id}", response_class=JSONResponse)
+    async def update_event(event_id: int, payload: dict):
+        kind = payload.get("kind")
+        meta = payload.get("meta")
+        ts = payload.get("ts")
+        if meta is not None and not isinstance(meta, dict):
+            raise HTTPException(400, "meta must be an object")
+        ok = state.events.update(
+            int(event_id),
+            kind=kind,
+            meta=meta,
+            ts=float(ts) if ts is not None else None,
+        )
+        if not ok:
+            raise HTTPException(404, "Event not found or nothing to update")
+        ev = state.events.get(int(event_id))
+        return {"ok": True, "event": ev}
+
+    @app.delete("/api/events/{event_id}", response_class=JSONResponse)
+    async def delete_event(event_id: int):
+        # Try to delete associated image files first
+        try:
+            ev = state.events.get(int(event_id))
+            if ev:
+                meta = ev.get("meta") or {}
+                for k in ("image_full", "image_crop", "image_thumb"):
+                    name = meta.get(k)
+                    if name:
+                        p = state.frames_dir / str(name)
+                        if p.exists():
+                            try:
+                                p.unlink()
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+        ok = state.events.delete(int(event_id))
+        if not ok:
+            raise HTTPException(404, "Event not found")
+        return {"ok": True}
+
+
+    @app.get("/api/event_explain", response_class=JSONResponse)
+    async def event_explain(id: int):
+        e = state.events.get(int(id))
+        if not e:
+            raise HTTPException(404, "Event not found")
+        meta = e.get("meta") or {}
+        spot_id = (meta.get("spot_id") or "").strip()
+        delta_bits = meta.get("delta_bits")
+        try:
+            delta_bits = int(delta_bits) if delta_bits is not None else None
+        except Exception:
+            delta_bits = None
+        min_bits = int(state.settings.phash_min_bits or 0)
+        stable_ms = int(state.settings.phash_stable_ms or 0)
+        if spot_id:
+            z = load_zones(state.zones_path)
+            sp = next((s for s in z.spots if s.id == spot_id), None)
+            if sp:
+                try:
+                    if getattr(sp, "min_bits", None) is not None:
+                        min_bits = int(sp.min_bits)
+                except Exception:
+                    pass
+                try:
+                    if getattr(sp, "stable_ms", None) is not None:
+                        stable_ms = int(sp.stable_ms)
+                except Exception:
+                    pass
+        meets = (delta_bits is not None and delta_bits >= min_bits)
+        explanation = {
+            "spot_id": spot_id,
+            "delta_bits": delta_bits,
+            "min_bits_used": min_bits,
+            "stable_ms_config": stable_ms,
+            "prev_sig": meta.get("prev_sig"),
+            "new_sig": meta.get("new_sig"),
+            "duration_prev": meta.get("duration_prev"),
+            "meets_threshold": meets,
+            "note": "Stable window enforced at trigger time; exact elapsed not stored.",
+        }
+        return {"ok": True, "explain": explanation}
+
+    @app.get("/api/spot_recent", response_class=JSONResponse)
+    async def spot_recent(per_spot: int = 2, scan_limit: int = 200):
+        try:
+            per_spot = max(1, int(per_spot))
+            scan_limit = max(1, int(scan_limit))
+        except Exception:
+            per_spot, scan_limit = 2, 200
+        # Collect recent spot_change events and group by spot
+        baseline = float(state.compare_baseline_ts or 0.0)
+        evs = [
+            e
+            for e in state.events.recent(scan_limit)
+            if str(e.get("kind", "")).lower() == "spot_change"
+            and (baseline <= 0.0 or float(e.get("ts", 0.0)) >= baseline)
+        ]
+        by_spot: dict[str, list[dict]] = {}
+        for e in evs:
+            sid = (e.get("meta") or {}).get("spot_id") or ""
+            if not sid:
+                continue
+            by_spot.setdefault(sid, []).append(e)
+            if len(by_spot[sid]) >= per_spot:
+                continue
+        out = []
+        for sid, lst in by_spot.items():
+            # lst is already newest-first from recent(); pick previous if available, else latest
+            prev = lst[1] if len(lst) >= 2 else lst[0]
+            meta = prev.get("meta") or {}
+            # Build URLs for display convenience
+            prev_id = prev["id"]
+            # Prefer thumb then crop then full (smaller consistent width)
+            prev_url = None
+            if meta.get("image_thumb"):
+                prev_url = f"/api/event_image?id={prev_id}&kind=thumb"
+            elif meta.get("image_crop"):
+                prev_url = f"/api/event_image?id={prev_id}&kind=crop"
+            elif meta.get("image_full"):
+                prev_url = f"/api/event_image?id={prev_id}&kind=full"
+            prev_sig = meta.get("new_sig") or meta.get("prev_sig")
+            # Filter using LLM significant flag when available; fallback to delta_bits threshold
+            significant = bool(meta.get("significant"))
+            if not significant:
+                try:
+                    dbits = int(meta.get("delta_bits") or 0)
+                    significant = dbits >= int(state.settings.phash_min_bits or 0) + 2
+                except Exception:
+                    significant = False
+            if not significant:
+                continue
+            out.append(
+                {
+                    "spot_id": sid,
+                    "prev_event_id": prev_id,
+                    "prev_url": prev_url,
+                    "prev_sig": prev_sig,
+                    "prev_ts": prev.get("ts"),
+                }
+            )
+        return {"items": out}
+
+    # Thumbnail and image helpers
+
+    @app.get("/api/thumbnails", response_class=JSONResponse)
+    async def thumbnails(limit: int = 60):
+        items = []
+        for e in state.events.recent(max(0, int(limit))):
+            meta = e.get("meta") or {}
+            thumb = (
+                meta.get("image_thumb")
+                or meta.get("image_crop")
+                or meta.get("image_full")
+            )
+            if not thumb:
+                continue
+            items.append(
+                {
+                    "event_id": e["id"],
+                    "spot_id": meta.get("spot_id", ""),
+                    "ts": e["ts"],
+                    "thumb": f"/api/event_image?id={e['id']}&kind=thumb",
+                    "full": f"/api/event_image?id={e['id']}&kind=full",
+                }
+            )
+            if len(items) >= limit:
+                break
+        return {"items": items}
+
+    @app.get("/api/images/summary", response_class=JSONResponse)
+    async def images_summary():
+        import os
+
+        total_files = 0
+        total_bytes = 0
+        if state.frames_dir.exists():
+            for p in state.frames_dir.glob("*.jpg"):
+                try:
+                    total_files += 1
+                    total_bytes += p.stat().st_size
+                except Exception:
+                    pass
+        ref = state.events.referenced_images()
+        orphan = 0
+        if state.frames_dir.exists():
+            for p in state.frames_dir.glob("*.jpg"):
+                if p.name not in ref:
+                    orphan += 1
+        return {
+            "files": total_files,
+            "bytes": total_bytes,
+            "referenced": len(ref),
+            "orphans": orphan,
+        }
+
+    @app.post("/api/images/cleanup", response_class=JSONResponse)
+    async def images_cleanup():
+        ref = state.events.referenced_images()
+        deleted = 0
+        if state.frames_dir.exists():
+            for p in state.frames_dir.glob("*.jpg"):
+                if p.name not in ref:
+                    try:
+                        p.unlink()
+                        deleted += 1
+                    except Exception:
+                        pass
+        return {"ok": True, "deleted": deleted}
+
+    def _do_control(action: str):
         if action == "start":
             if not settings.rtsp_url:
                 raise HTTPException(400, "RTSP_URL not configured")
@@ -205,9 +634,22 @@ def create_app() -> FastAPI:
         elif action == "stop":
             if state.capture:
                 state.capture.stop()
+                # Reset worker so a fresh start() creates a new thread cleanly
+                try:
+                    state.capture = None
+                except Exception:
+                    pass
             return {"ok": True, "running": False}
         else:
             raise HTTPException(400, "Unknown action")
+
+    @app.post("/api/control", response_class=JSONResponse)
+    async def api_control_post(action: str):
+        return _do_control(action)
+
+    @app.get("/api/control", response_class=JSONResponse)
+    async def api_control_get(action: str):
+        return _do_control(action)
 
     @app.get("/frame.jpg")
     async def frame() -> Response:
@@ -224,7 +666,7 @@ def create_app() -> FastAPI:
     # gate endpoint removed
 
     @app.get("/api/spot.jpg")
-    async def spot_crop(id: str) -> Response:
+    async def spot_crop(id: str, w: int = 0) -> Response:
         if not state.capture:
             raise HTTPException(404, "No capture running")
         latest = state.capture.latest()
@@ -245,7 +687,18 @@ def create_app() -> FastAPI:
         if x2 <= x1 or y2 <= y1:
             raise HTTPException(400, "Invalid spot polygon bounds")
         crop = frame[y1:y2, x1:x2].copy()
-        jpg = state.capture.encode_jpeg(crop)
+        # Optional scaling to a requested width (maintain aspect)
+        if isinstance(w, int) and w and w > 0:
+            import cv2
+
+            h_c, w_c = crop.shape[:2]
+            if w_c > 0 and h_c > 0 and w_c != w:
+                new_w = int(w)
+                new_h = max(1, int(h_c * (new_w / w_c)))
+                crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        jpg = state.capture.encode_jpeg(
+            crop, quality=int(state.settings.jpeg_quality or 80)
+        )
         return Response(content=jpg, media_type="image/jpeg")
 
     # removed spot_suggest endpoint — manual rotation preferred
@@ -261,37 +714,17 @@ def create_app() -> FastAPI:
         save_zones(state.zones_path, load_zones_from_payload(payload))
         return {"ok": True}
 
-    return app
-
-
-def load_zones_from_payload(payload: dict):
-    from .zones import Zones, Spot
-
-    gate_p = payload.get("gate")
-    gate_poly = None
-    if gate_p:
-        if isinstance(gate_p, dict) and gate_p.get("polygon"):
-            gate_poly = [tuple(p) for p in gate_p["polygon"]]
-        elif isinstance(gate_p, dict) and gate_p.get("center") is not None:
-            cx, cy = gate_p["center"]
-            w = float(gate_p.get("w", 0))
-            h = float(gate_p.get("h", 0))
-            x0, y0 = cx - w/2.0, cy - h/2.0
-            gate_poly = [(x0, y0), (x0+w, y0), (x0+w, y0+h), (x0, y0+h)]
-        elif isinstance(gate_p, list):
-            gate_poly = [tuple(p) for p in gate_p]
-    spots_payload = payload.get("spots", [])
-    spots = [Spot(id=s["id"], name=s.get("name", s.get("id", "")), polygon=[tuple(p) for p in s.get("polygon", [])]) for s in spots_payload]
-    return Zones(gate=gate_poly, spots=spots)
-
     # Analysis tasks/result endpoints
     @app.get("/api/analysis/tasks", response_class=JSONResponse)
     async def analysis_tasks(limit: int = 5):
         import json
+
         tasks_dir = state.data_dir / "analysis" / "tasks"
         items = []
         if tasks_dir.exists():
-            files = sorted(tasks_dir.glob("*.json"), key=lambda p: p.name, reverse=True)[:limit]
+            files = sorted(
+                tasks_dir.glob("*.json"), key=lambda p: p.name, reverse=True
+            )[:limit]
             for p in files:
                 try:
                     with p.open("r", encoding="utf-8") as f:
@@ -305,6 +738,7 @@ def load_zones_from_payload(payload: dict):
     @app.post("/api/analysis/result", response_class=JSONResponse)
     async def analysis_result(payload: dict):
         import json
+
         tid = str(payload.get("id", ""))
         if not tid:
             raise HTTPException(400, "Missing id")
@@ -321,6 +755,7 @@ def load_zones_from_payload(payload: dict):
     @app.get("/api/analysis/latest", response_class=JSONResponse)
     async def analysis_latest():
         import json
+
         res_dir = state.data_dir / "analysis" / "results"
         if not res_dir.exists():
             return {"result": None}
@@ -330,355 +765,261 @@ def load_zones_from_payload(payload: dict):
         with files[0].open("r", encoding="utf-8") as f:
             return {"result": json.load(f)}
 
-
-INDEX_HTML = """
-<!DOCTYPE html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>Backyard Monitor</title>
-    <style>
-      body { font-family: -apple-system, system-ui, sans-serif; margin: 20px; }
-      .row { display:flex; gap:16px; align-items:flex-start; }
-      .card { border:1px solid #ddd; padding:12px; border-radius:8px; }
-      #canvasWrap { position: relative; display:inline-block; }
-      canvas { border-radius:8px; border:1px solid #ddd; display:block; }
-      table { border-collapse: collapse; }
-      td, th { border: 1px solid #ddd; padding: 4px 8px; }
-      .controls button { margin-right: 8px; }
-      .muted { color:#666; }
-      label { display:block; margin-top:6px; }
-      input[type=number] { width: 6em; }
-      .tooltip { position:absolute; background:#fff; border:1px solid #ccc; border-radius:8px; box-shadow:0 2px 12px rgba(0,0,0,0.12); padding:6px 8px; display:none; z-index:10; }
-      .tooltip button { margin-right:6px; }
-    </style>
-  </head>
-  <body>
-    <h1>Backyard Monitor</h1>
-    <div class="controls">
-      <button onclick="control('start')">Start</button>
-      <button onclick="control('stop')">Stop</button>
-      <span class="muted">Spots: click to add; click to select; arrows to nudge; Delete to remove.</span>
-    </div>
-    <div class="row" style="margin-top:12px;">
-      <div class="card">
-        <div><strong>Live Frame</strong></div>
-        <div id="canvasWrap">
-          <canvas id="canvas" width="640" height="360"></canvas>
-          <div id="spotToolbar" class="tooltip"></div>
-        </div>
-        <div class="muted" id="status"></div>
-        <div style="margin-top:8px; display:flex; gap:8px; align-items:center; flex-wrap: wrap;">
-          <button onclick="saveZones()">Save Zones</button>
-          <button onclick="clearSpots()">Clear Spots</button>
-          <button id="sizeBtn" onclick="toggleSize()">Shrink</button>
-        </div>
-        
-      </div>
-      <div class="card">
-        <div style="margin-top:12px;"><strong>Spot Preview</strong>
-          <label>Spot <select id="spot_select"></select></label>
-          <button onclick="previewSpot()">Preview</button>
-          <div><img id="spotimg" class="thumb" style="margin-top:6px;"/></div>
-        </div>
-        <div style="margin-top:12px;"><strong>Spot Events (last 10)</strong></div>
-        <table id="events"></table>
-      </div>
-      <div class="card">
-        <div><strong>Spots</strong></div>
-        <table id="spot_stats"><tr><th>Spot</th><th>Center</th><th>Size</th><th>Present For</th><th>Preview</th></tr></table>
-      </div>
-    </div>
-    <script>
-      let spots = []; // [{id,name,polygon:[[x,y],...]}]
-      let selectedSpotId = null;
-      const DEFAULT_SPOT = { w: 120, h: 200 };
-      const canvas = document.getElementById('canvas');
-      const ctx = canvas.getContext('2d');
-      const canvasWrap = document.getElementById('canvasWrap');
-      const spotToolbar = document.getElementById('spotToolbar');
-      let baseW = 0, baseH = 0; // native frame size
-
-      async function control(action) {
-        const res = await fetch('/api/control?action=' + action, { method: 'POST' });
-        const j = await res.json();
-        console.log(j);
-        await refresh();
-      }
-      async function refresh() {
-        const status = await (await fetch('/api/status')).json();
-        document.getElementById('status').innerText = `running=${status.running} last_ts=${status.last_ts} size=${status.width}x${status.height}`;
-        if (status.width && status.height) {
-          baseW = status.width; baseH = status.height;
-          // keep current scale or default to 1.0 first time
-          const curScale = (canvas.width && baseW) ? (canvas.width / baseW) : 1.0;
-          const s = (curScale > 0 ? curScale : 1.0);
-          canvas.width = Math.round(baseW * s);
-          canvas.height = Math.round(baseH * s);
-          const btn = document.getElementById('sizeBtn');
-          if (btn) btn.textContent = (s === 1.0) ? 'Shrink' : 'Expand';
+    # Simple config helpers to get/set RTSP_URL in .env
+    @app.get("/api/config", response_class=JSONResponse)
+    async def get_config():
+        return {
+            "RTSP_URL": settings.rtsp_url or "",
+            "DATA_DIR": str(settings.data_dir),
+            "PHASH_MIN_BITS": int(settings.phash_min_bits or 0),
+            "PHASH_STABLE_MS": int(settings.phash_stable_ms or 0),
         }
-        const events = (status.events || []).filter(e => String(e.kind||'').toLowerCase() === 'spot_change').slice(0,10);
-        const et = document.getElementById('events');
-        et.innerHTML = events.map(e => {
-          const ts = new Date(e.ts*1000).toLocaleString();
-          const spot = (e.meta && e.meta.spot_id) ? e.meta.spot_id : '';
-          return `<div style="display:inline-block; margin:6px; text-align:center;">`
-                 + `<a href="/api/event_image?id=${e.id}&kind=full" target="_blank">`
-                 + `<img class="thumb" src="/api/event_image?id=${e.id}&kind=thumb"/>`
-                 + `</a>`
-                 + `<div class="muted" style="max-width:240px;">${ts} • ${spot}</div>`
-                 + `</div>`;
-        }).join('');
-      }
 
-      function rectPolygon(cx, cy, w, h) {
-        const x0 = cx - w/2, y0 = cy - h/2;
-        return [ [x0,y0], [x0+w,y0], [x0+w,y0+h], [x0,y0+h] ];
-      }
-      function pointInPoly(pt, poly) {
-        let [x, y] = pt; let inside = false;
-        for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-          const xi = poly[i][0], yi = poly[i][1];
-          const xj = poly[j][0], yj = poly[j][1];
-          const intersect = ((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / ((yj - yi) || 1e-9) + xi);
-          if (intersect) inside = !inside;
-        }
-        return inside;
-      }
-
-      function deleteSelected(){
-        if (!selectedSpotId) return;
-        spots = spots.filter(sp => sp.id !== selectedSpotId);
-        selectedSpotId = null;
-        updateToolbar();
-        draw();
-      }
-
-      function rotateSelected(deg){
-        if (!selectedSpotId) return;
-        const s = spots.find(sp => sp.id === selectedSpotId);
-        if (!s || !s.polygon || s.polygon.length < 3) return;
-        const xs = s.polygon.map(p=>p[0]); const ys = s.polygon.map(p=>p[1]);
-        const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
-        const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
-        const ang = (deg * Math.PI) / 180;
-        const ca = Math.cos(ang), sa = Math.sin(ang);
-        s.polygon = s.polygon.map(([px,py]) => {
-          const dx = px - cx, dy = py - cy;
-          const rx = dx*ca - dy*sa; const ry = dx*sa + dy*ca;
-          return [cx + rx, cy + ry];
-        });
-        updateToolbar();
-        draw();
-      }
-
-      function updateSpotName(name){
-        if (!selectedSpotId) return;
-        const s = spots.find(sp => sp.id === selectedSpotId);
-        if (s) { s.name = (name || '').trim() || s.id; updateToolbar(); draw(); }
-      }
-
-      function selectedBBox(){
-        const s = spots.find(sp => sp.id === selectedSpotId);
-        if (!s || !s.polygon || s.polygon.length < 3) return null;
-        const xs = s.polygon.map(p=>p[0]); const ys = s.polygon.map(p=>p[1]);
-        const x1 = Math.min(...xs), x2 = Math.max(...xs), y1 = Math.min(...ys), y2 = Math.max(...ys);
-        return { x: x1, y: y1, w: x2-x1, h: y2-y1, name: s.name || s.id };
-      }
-
-      function updateToolbar(){
-        const box = selectedBBox();
-        if (!box){ spotToolbar.style.display = 'none'; return; }
-        spotToolbar.style.display = 'block';
-        const pad = 8;
-        const sx = baseW ? (canvas.width / baseW) : 1;
-        const sy = baseH ? (canvas.height / baseH) : 1;
-        let tx = Math.max(pad, Math.min(canvas.width - 220, Math.round(box.x * sx)));
-        let ty = Math.max(pad, Math.min(canvas.height - 44, Math.round(box.y * sy) - 36));
-        spotToolbar.style.left = `${tx}px`;
-        spotToolbar.style.top = `${ty}px`;
-        const safe = (s) => String(s||'').replace(/[&<>]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]||c));
-        spotToolbar.innerHTML = `
-          <div style="display:flex; align-items:center; gap:6px;">
-            <input id="tb_name" type="text" value="${safe(box.name)}" style="max-width:120px;"/>
-            <button id="tb_save">Save</button>
-            <button id="tb_rn">-10°</button>
-            <button id="tb_rp">+10°</button>
-            <button id="tb_del" style="color:#a00;">Delete</button>
-          </div>`;
-        document.getElementById('tb_save').onclick = () => {
-          const v = document.getElementById('tb_name').value; updateSpotName(v);
-        };
-        document.getElementById('tb_rn').onclick = () => rotateSelected(-10);
-        document.getElementById('tb_rp').onclick = () => rotateSelected(10);
-        document.getElementById('tb_del').onclick = () => deleteSelected();
-      }
-      window.addEventListener('resize', updateToolbar);
-
-      function toggleSize(){
-        if (!baseW || !baseH) return;
-        const curScale = canvas.width / baseW;
-        const nextScale = curScale > 0.75 ? 0.5 : 1.0;
-        canvas.width = Math.round(baseW * nextScale);
-        canvas.height = Math.round(baseH * nextScale);
-        const btn = document.getElementById('sizeBtn');
-        if (btn) btn.textContent = (nextScale === 1.0) ? 'Shrink' : 'Expand';
-        draw();
-      }
-
-      async function draw() {
-        // draw latest frame
-        const img = new Image();
-        img.onload = () => {
-          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-          // overlay spots as rectangles
-          if (spots && spots.length) {
-            ctx.strokeStyle = '#44aaff'; ctx.lineWidth = 2; ctx.fillStyle = 'rgba(68,170,255,0.12)';
-            for (const s of spots) {
-              if (!s.polygon || s.polygon.length < 4) continue;
-              const sx = baseW ? (canvas.width / baseW) : 1;
-              const sy = baseH ? (canvas.height / baseH) : 1;
-              const p0 = s.polygon[0];
-              ctx.beginPath(); ctx.moveTo(p0[0]*sx, p0[1]*sy);
-              for (let i=1;i<s.polygon.length;i++){ const p = s.polygon[i]; ctx.lineTo(p[0]*sx, p[1]*sy); }
-              ctx.closePath(); ctx.stroke(); ctx.fill();
-              if (s.id === selectedSpotId) {
-                ctx.strokeStyle = '#ffaa00'; ctx.lineWidth = 2; ctx.setLineDash([6,4]);
-                ctx.stroke(); ctx.setLineDash([]); ctx.strokeStyle = '#44aaff';
-              }
+    @app.post("/api/config", response_class=JSONResponse)
+    async def set_config(payload: dict):
+        # Optional values; only set if provided
+        rtsp = payload.get("RTSP_URL")
+        phash_bits = payload.get("PHASH_MIN_BITS")
+        phash_ms = payload.get("PHASH_STABLE_MS")
+        # Update in-memory settings for this process
+        if rtsp is not None:
+            rtsp_str = str(rtsp).strip()
+            if not rtsp_str:
+                raise HTTPException(400, "RTSP_URL required")
+            settings.rtsp_url = rtsp_str
+        if phash_bits is not None:
+            try:
+                settings.phash_min_bits = int(phash_bits)
+            except Exception:
+                raise HTTPException(400, "PHASH_MIN_BITS must be an integer")
+        if phash_ms is not None:
+            try:
+                settings.phash_stable_ms = int(phash_ms)
+            except Exception:
+                raise HTTPException(400, "PHASH_STABLE_MS must be an integer")
+        # Persist to project .env
+        try:
+            project_root = Path(__file__).resolve().parents[1]
+            env_path = project_root / ".env"
+            # read existing (if any)
+            lines = []
+            if env_path.exists():
+                lines = env_path.read_text(encoding="utf-8").splitlines()
+            kv = {
+                "RTSP_URL": settings.rtsp_url or "",
+                "PHASH_MIN_BITS": str(int(settings.phash_min_bits or 0)),
+                "PHASH_STABLE_MS": str(int(settings.phash_stable_ms or 0)),
             }
-          }
-          updateToolbar();
-        };
-        img.src = '/frame.jpg?ts=' + Date.now();
-      }
-
-      canvas.addEventListener('click', async (e) => {
-        const rect = canvas.getBoundingClientRect();
-        const sx = baseW ? (baseW / canvas.width) : 1;
-        const sy = baseH ? (baseH / canvas.height) : 1;
-        const x = Math.round((e.clientX - rect.left) * sx);
-        const y = Math.round((e.clientY - rect.top) * sy);
-        const hit = spots.find(s => pointInPoly([x,y], s.polygon));
-        if (hit) {
-          selectedSpotId = hit.id;
-          updateToolbar();
-        } else {
-          const id = 'spot_' + (spots.length + 1);
-          let poly = rectPolygon(x, y, DEFAULT_SPOT.w, DEFAULT_SPOT.h);
-          spots.push({ id, name: id, polygon: poly });
-          selectedSpotId = id;
-          updateToolbar();
+            keys = set(kv.keys())
+            out_lines = []
+            seen = set()
+            for ln in lines:
+                k = ln.split("=", 1)[0].strip()
+                if k in keys:
+                    out_lines.append(f"{k}={kv[k]}")
+                    seen.add(k)
+                else:
+                    out_lines.append(ln)
+            for k in keys - seen:
+                out_lines.append(f"{k}={kv[k]}")
+            env_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+        except Exception as e:
+            raise HTTPException(500, f"Failed to write .env: {e}")
+        return {
+            "ok": True,
+            "RTSP_URL": settings.rtsp_url or "",
+            "PHASH_MIN_BITS": int(settings.phash_min_bits or 0),
+            "PHASH_STABLE_MS": int(settings.phash_stable_ms or 0),
         }
-        renderZonesView();
-        draw();
-      });
 
-      document.addEventListener('keydown', (e) => {
-        if (!selectedSpotId) return;
-        const s = spots.find(sp => sp.id === selectedSpotId);
-        if (!s) return;
-        const step = (e.shiftKey ? 10 : 5);
-        if (e.key === 'Delete' || e.key === 'Backspace') {
-          spots = spots.filter(sp => sp.id !== selectedSpotId);
-          selectedSpotId = null; renderZonesView(); draw(); e.preventDefault(); return;
-        }
-        let dx = 0, dy = 0;
-        if (e.key === 'ArrowLeft') dx = -step;
-        else if (e.key === 'ArrowRight') dx = step;
-        else if (e.key === 'ArrowUp') dy = -step;
-        else if (e.key === 'ArrowDown') dy = step;
-        if (dx || dy) {
-          s.polygon = s.polygon.map(p => [p[0] + dx, p[1] + dy]);
-          renderZonesView(); draw(); e.preventDefault();
-        }
-      });
+    # Manual retention trigger
+    @app.post("/api/retention/apply", response_class=JSONResponse)
+    async def retention_apply():
+        deleted = 0
+        try:
+            deleted = apply_retention_sweep()
+        except Exception:
+            pass
+        return {"ok": True, "deleted": deleted}
 
-      async function saveZones(){
-        const payload = { spots };
-        await fetch('/api/zones', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-        alert('Saved');
-      }
+    # Comparison baseline helpers
+    @app.get("/api/compare/baseline", response_class=JSONResponse)
+    async def compare_get_baseline():
+        return {"baseline_ts": state.compare_baseline_ts}
 
-      async function loadZones(){
-        const res = await fetch('/api/zones');
-        const z = await res.json();
-        spots = z.spots || [];
-        renderZonesView();
-      }
+    @app.post("/api/compare/baseline", response_class=JSONResponse)
+    async def compare_set_baseline(payload: dict | None = None):
+        import time as _t
 
-      function clearSpots(){ spots = []; selectedSpotId = null; draw(); }
-      function renderZonesView(){ /* we keep homepage minimal; could add JSON preview if desired */ }
+        ts = None
+        try:
+            if payload and "ts" in payload:
+                ts = float(payload.get("ts"))
+        except Exception:
+            ts = None
+        if ts is None or ts <= 0:
+            ts = _t.time()
+        state.compare_baseline_ts = float(ts)
+        return {"ok": True, "baseline_ts": state.compare_baseline_ts}
 
-      setInterval(() => { draw(); }, 1000);
-      async function updatePanels(){
-        try {
-          const [zones, status, spotStats] = await Promise.all([
-            fetch('/api/zones').then(r=>r.json()),
-            fetch('/api/status').then(r=>r.json()),
-            fetch('/api/spot_stats').then(r=>r.json())
-          ]);
-          const sel = document.getElementById('spot_select');
-          if (sel) {
-            const cur = sel.value;
-            sel.innerHTML = (zones.spots || []).map(s => `<option value="${s.id}">${s.name || s.id}</option>`).join('');
-            if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
-          }
-          const tbl = document.getElementById('spot_stats');
-          const spotsList = zones.spots || [];
-          const statMap = Object.fromEntries((spotStats.spots||[]).map(x => [x.id, x]));
-          tbl.innerHTML = '<tr><th>Spot</th><th>Center</th><th>Size</th><th>Present For</th><th>Preview</th></tr>' + spotsList.map(s => {
-            const xs=s.polygon.map(p=>p[0]); const ys=s.polygon.map(p=>p[1]);
-            const x1=Math.min(...xs), x2=Math.max(...xs), y1=Math.min(...ys), y2=Math.max(...ys);
-            const center = isFinite(x1+x2) ? `${Math.round((x1+x2)/2)},${Math.round((y1+y2)/2)}` : '-';
-            const size = isFinite(x2-x1) ? `${Math.round(x2-x1)}×${Math.round(y2-y1)}` : '-';
-            const stat = statMap[s.id] || {}; const secs = stat.duration_sec || 0;
-            const dur = secs ? fmtDuration(secs) : '-';
-            const img = `<img class=\"thumb\" src=\"/api/spot.jpg?id=${encodeURIComponent(s.id)}&ts=${Date.now()}\"/>`;
-            const safe = (t) => String(t||'').replace(/[&<>]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]||c));
-            return `<tr>`+
-              `<td><input id=\"name_${s.id}\" type=\"text\" value=\"${safe(s.name||s.id)}\" style=\"max-width:120px;\"/>`+
-              ` <button onclick=\"renameSpot('${s.id}')\">Save</button></td>`+
-              `<td>${center}</td><td>${size}</td><td>${dur}</td><td>${img}</td></tr>`;
-          }).join('');
-          draw();
-        } catch {}
-      }
-      function fmtDuration(secs){
-        secs = Math.floor(secs);
-        const h = Math.floor(secs/3600); secs -= h*3600;
-        const m = Math.floor(secs/60); secs -= m*60;
-        const s = secs;
-        const parts = [];
-        if (h) parts.push(h+'h'); if (m) parts.push(m+'m'); parts.push(s+'s');
-        return parts.join(' ');
-      }
-      setInterval(updatePanels, 1500);
-      function previewSpot(){
-        const sel = document.getElementById('spot_select');
-        if (!sel || !sel.value) return;
-        document.getElementById('spotimg').src = `/api/spot.jpg?id=${encodeURIComponent(sel.value)}&ts=` + Date.now();
-      }
-      async function renameSpot(id){
-        try {
-          const input = document.getElementById('name_'+id);
-          const newName = input ? input.value : '';
-          // pull current zones
-          const z = await (await fetch('/api/zones')).json();
-          const spotsZ = z.spots || [];
-          for (const sp of spotsZ){ if (sp.id === id){ sp.name = newName || sp.id; break; } }
-          await fetch('/api/zones', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ spots: spotsZ }) });
-          // refresh panels after save
-          updatePanels();
-        } catch (e) { console.error(e); }
-      }
-      refresh();
-      loadZones();
-    </script>
-  </body>
-</html>
-"""
+    @app.post("/api/compare/clear", response_class=JSONResponse)
+    async def compare_clear_baseline():
+        state.compare_baseline_ts = 0.0
+        return {"ok": True, "baseline_ts": state.compare_baseline_ts}
+
+    @app.get("/api/spot_history", response_class=JSONResponse)
+    async def spot_history(spot_id: str, limit: int = 8):
+        evs = state.events.spot_events(spot_id, limit)
+        out = []
+        for e in evs:
+            out.append(
+                {
+                    "id": e["id"],
+                    "ts": e["ts"],
+                    "spot_id": spot_id,
+                    "thumb": f"/api/event_image?id={e['id']}&kind=thumb",
+                    "full": f"/api/event_image?id={e['id']}&kind=full",
+                    "crop": f"/api/event_image?id={e['id']}&kind=crop",
+                }
+            )
+        return {"items": out}
+
+    return app
+
+
+def load_zones_from_payload(payload: dict):
+    from .zones import Zones, Spot
+
+    gate_p = payload.get("gate")
+    gate_poly = None
+    if gate_p:
+        if isinstance(gate_p, dict) and gate_p.get("polygon"):
+            gate_poly = [tuple(p) for p in gate_p["polygon"]]
+        elif isinstance(gate_p, dict) and gate_p.get("center") is not None:
+            cx, cy = gate_p["center"]
+            w = float(gate_p.get("w", 0))
+            h = float(gate_p.get("h", 0))
+            x0, y0 = cx - w / 2.0, cy - h / 2.0
+            gate_poly = [(x0, y0), (x0 + w, y0), (x0 + w, y0 + h), (x0, y0 + h)]
+        elif isinstance(gate_p, list):
+            gate_poly = [tuple(p) for p in gate_p]
+    spots_payload = payload.get("spots", [])
+    spots = []
+    for s in spots_payload:
+        spots.append(
+            Spot(
+                id=s["id"],
+                name=s.get("name", s.get("id", "")),
+                polygon=[tuple(p) for p in s.get("polygon", [])],
+                min_bits=s.get("min_bits"),
+                stable_ms=s.get("stable_ms"),
+            )
+        )
+    return Zones(gate=gate_poly, spots=spots)
+
+    # Analysis tasks/result endpoints
+    @app.get("/api/analysis/tasks", response_class=JSONResponse)
+    async def analysis_tasks(limit: int = 5):
+        import json
+
+        tasks_dir = state.data_dir / "analysis" / "tasks"
+        items = []
+        if tasks_dir.exists():
+            files = sorted(
+                tasks_dir.glob("*.json"), key=lambda p: p.name, reverse=True
+            )[:limit]
+            for p in files:
+                try:
+                    with p.open("r", encoding="utf-8") as f:
+                        t = json.load(f)
+                    t["image_url"] = f"/data/{t.get('image','')}"
+                    items.append(t)
+                except Exception:
+                    continue
+        return {"tasks": items}
+
+    @app.post("/api/analysis/result", response_class=JSONResponse)
+    async def analysis_result(payload: dict):
+        import json
+
+        tid = str(payload.get("id", ""))
+        if not tid:
+            raise HTTPException(400, "Missing id")
+        out_dir = state.data_dir / "analysis" / "results"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with (out_dir / f"{tid}.json").open("w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        try:
+            state.events.add("analysis", {"task": tid})
+        except Exception:
+            pass
+        return {"ok": True}
+
+    @app.get("/api/analysis/latest", response_class=JSONResponse)
+    async def analysis_latest():
+        import json
+
+        res_dir = state.data_dir / "analysis" / "results"
+        if not res_dir.exists():
+            return {"result": None}
+        files = sorted(res_dir.glob("*.json"), key=lambda p: p.name, reverse=True)
+        if not files:
+            return {"result": None}
+        with files[0].open("r", encoding="utf-8") as f:
+            return {"result": json.load(f)}
+
+    # Simple config helpers to get/set RTSP_URL in .env
+    @app.get("/api/config", response_class=JSONResponse)
+    async def get_config():
+        return {"RTSP_URL": settings.rtsp_url or "", "DATA_DIR": str(settings.data_dir)}
+
+    @app.post("/api/config", response_class=JSONResponse)
+    async def set_config(payload: dict):
+        rtsp = str(payload.get("RTSP_URL", "")).strip()
+        if not rtsp:
+            raise HTTPException(400, "RTSP_URL required")
+        # Update in-memory settings for this process
+        settings.rtsp_url = rtsp
+        # Persist to project .env
+        try:
+            project_root = Path(__file__).resolve().parents[1]
+            env_path = project_root / ".env"
+            # read existing (if any), replace line or append
+            lines = []
+            if env_path.exists():
+                lines = env_path.read_text(encoding="utf-8").splitlines()
+            updated = False
+            out_lines = []
+            for ln in lines:
+                if ln.strip().startswith("RTSP_URL="):
+                    out_lines.append(f"RTSP_URL={rtsp}")
+                    updated = True
+                else:
+                    out_lines.append(ln)
+            if not updated:
+                out_lines.append(f"RTSP_URL={rtsp}")
+            env_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+        except Exception as e:
+            raise HTTPException(500, f"Failed to write .env: {e}")
+        return {"ok": True, "RTSP_URL": rtsp}
+
+    @app.get("/api/spot_history", response_class=JSONResponse)
+    async def spot_history(spot_id: str, limit: int = 8):
+        evs = state.events.spot_events(spot_id, limit)
+        out = []
+        for e in evs:
+            meta = e.get("meta") or {}
+            out.append(
+                {
+                    "id": e["id"],
+                    "ts": e["ts"],
+                    "spot_id": spot_id,
+                    "thumb": f"/api/event_image?id={e['id']}&kind=thumb",
+                    "full": f"/api/event_image?id={e['id']}&kind=full",
+                    "crop": f"/api/event_image?id={e['id']}&kind=crop",
+                }
+            )
+        return {"items": out}
 
 
 app = create_app()

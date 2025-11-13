@@ -21,8 +21,9 @@ No separate CLI is needed; everything runs behind the webserver.
 
 3) Run the server
 
-- `uvicorn bm.app:app --reload --port 8080`
- - Open http://localhost:8080 — one page for live view, spot calibration, previews, stats, and events.
+- Shortcut: `uv run backyardmonitor --reload --port 8080 --env-file .env`
+  - Or: `uvicorn bm.app:app --reload --port 8080 --env-file .env`
+ - Open http://localhost:8080 — one page for live view, spot calibration, and a generic JSON editor for zones, events, and image management.
 
 ## Calibrate
 
@@ -31,9 +32,25 @@ No separate CLI is needed; everything runs behind the webserver.
   - Click a spot to select; use arrow keys to nudge (Shift for faster); Delete to remove.
   - Rotate selected with the Rotate buttons; rename via the Name field.
   - The app tracks visual changes per spot and logs spot_change events with durations.
-  - Zones persist to `DATA_DIR/zones.json`.
+  - Zones persist to `DATA_DIR/zones.json`. You can also edit zones JSON directly in the right-side Data panel.
+
+- Events
+  - Use the Data panel to list recent events, edit event kind/meta JSON, or delete events.
 
 ## Notes
 
 - This is the clean rewrite with minimal pieces. Detection is intentionally simple/placeholder initially; the focus is easy setup and manual calibration.
 - Old code is preserved under `reference_main/` on this branch for reference only.
+
+## Retention and storage
+
+Environment knobs (with sane defaults):
+- `STORE_FULL_FRAMES` (default: false)
+- `STORE_CROPS` (default: false)
+- `STORE_THUMBS` (default: true)
+- `JPEG_QUALITY` (default: 80)
+- `RETAIN_DAYS` (default: 3)
+- `MAX_EVENTS` (default: 5000)
+- `MAX_STORAGE_GB` (default: 10)
+
+Use the Data panel → Images to view summary and cleanup orphans. You can also trigger retention manually via `POST /api/retention/apply`.

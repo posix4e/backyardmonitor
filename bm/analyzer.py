@@ -15,7 +15,7 @@ class AnalysisTaskMeta:
     id: str
     ts: float
     image_path: str  # relative to data dir, e.g., analysis/imgs/<id>.jpg
-    json_path: str   # relative to data dir, e.g., analysis/tasks/<id>.json
+    json_path: str  # relative to data dir, e.g., analysis/tasks/<id>.json
 
 
 class AnalysisWorker:
@@ -40,7 +40,9 @@ class AnalysisWorker:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="AnalysisWorker", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run, name="AnalysisWorker", daemon=True
+        )
         self._thread.start()
 
     def stop(self):
@@ -98,6 +100,6 @@ class AnalysisWorker:
         json_rel = f"analysis/tasks/{tid}.json"
         json_path = self.data_dir / json_rel
         import json
+
         with json_path.open("w", encoding="utf-8") as f:
             json.dump(task, f)
-
