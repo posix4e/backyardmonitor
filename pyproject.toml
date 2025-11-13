@@ -1,0 +1,16 @@
+[project]
+name = "backyardmonitor"
+version = "0.1.0"
+description = "Simple gate + parking monitor (rewrite)"
+requires-python = ">=3.9"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.23",
+  "opencv-python-headless>=4.7",
+  "numpy>=1.24",
+]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
