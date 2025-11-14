@@ -11,7 +11,6 @@ WORKDIR /app
 ENV PIP_NO_CACHE_DIR=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
 COPY pyproject.toml /app/
-COPY uv.lock /app/
 RUN pip install --upgrade pip setuptools wheel
 
 # Copy source
@@ -29,4 +28,3 @@ VOLUME ["/data"]
 EXPOSE 8080
 
 CMD ["backyardmonitor", "--host", "0.0.0.0", "--port", "8080", "--env-file", "/app/.env"]
-
