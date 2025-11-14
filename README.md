@@ -25,6 +25,29 @@ No separate CLI is needed; everything runs behind the webserver.
   - Or: `uvicorn bm.app:app --reload --port 8080 --env-file .env`
  - Open http://localhost:8080 — one page for live view, spot calibration, and a generic JSON editor for zones, events, and image management.
 
+## Proxmox LXC (Docker) Deploy
+
+Use this when running on a Proxmox host (e.g., root@192.168.2.4) in a Debian 12 LXC with nesting.
+
+- Create the LXC on the Proxmox host (example VMID 101):
+  - `pveam update && pveam download local debian-12-standard_12*amd64.tar.zst`
+  - `pct create 101 local:vztmpl/debian-12-standard_12*amd64.tar.zst -hostname backyardmonitor -net0 name=eth0,bridge=vmbr0,ip=dhcp -cores 2 -memory 2048 -rootfs local-lvm:8 -features nesting=1,keyctl=1 -unprivileged 0`
+  - `pct start 101 && pct enter 101`
+
+- Inside the LXC, run the bootstrap script:
+  - `bash -c "curl -fsSL https://raw.githubusercontent.com/posix4e/backyardmonitor/main/scripts/proxmox_lxc_bootstrap.sh -o /root/proxmox_lxc_bootstrap.sh && bash /root/proxmox_lxc_bootstrap.sh"`
+  - If `curl` access to GitHub is restricted, you can copy this repo into the LXC manually and run `bash /opt/backyardmonitor/scripts/proxmox_lxc_bootstrap.sh`.
+
+- Provide your existing `.env` (from this repo on your workstation):
+  - `scp .env root@<LXC-IP>:/opt/backyardmonitor/.env`
+  - Then re-run: `bash /opt/backyardmonitor/scripts/proxmox_lxc_bootstrap.sh`
+
+- Access the UI at `http://<LXC-IP>:8080/`.
+
+Notes:
+- The compose file mounts `./data` to `/data` in the container and `./.env` to `/app/.env:ro`.
+- Ensure the LXC network can reach your camera in `.env` (`RTSP_URL`).
+
 ## Calibrate
 
 - Spots
