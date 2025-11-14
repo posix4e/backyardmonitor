@@ -8,7 +8,7 @@
       .muted { color:#666; }
       label { display:block; margin-top:6px; }
       input[type=number] { width: 6em; }
-      .tooltip { position:absolute; background:#fff; border:1px solid #ccc; border-radius:8px; box-shadow:0 2px 12px rgba(0,0,0,0.12); padding:6px 8px; display:none; z-index:10; }
+      .tooltip { position:absolute; background:#fff; border:1px solid #ccc; border-radius:8px; box-shadow:0 2px 12px rgba(0,0,0,0.12); padding:6px 8px; display:none; z-index:1000; pointer-events:auto; }
       .tooltip button { margin-right:6px; }
       .pulse-indicator { position:absolute; border-radius:6px; box-shadow:0 0 0 2px rgba(255,0,0,0.5), 0 0 18px rgba(255,0,0,0.35); animation:pulse 1s ease-out infinite; pointer-events:none; z-index:9; }
       @keyframes pulse { 0%{ box-shadow:0 0 0 2px rgba(255,0,0,0.6), 0 0 0 rgba(255,0,0,0.0);} 70%{ box-shadow:0 0 0 6px rgba(255,0,0,0.2), 0 0 18px rgba(255,0,0,0.4);} 100%{ box-shadow:0 0 0 2px rgba(255,0,0,0.6), 0 0 0 rgba(255,0,0,0.0);} }
@@ -44,6 +44,7 @@
           <button onclick="saveZones()">Save Zones</button>
           <button onclick="clearSpots()">Clear Spots</button>
           <button id="sizeBtn" onclick="toggleSize()">Expand</button>
+          <button id="annoBtn" onclick="toggleAnno()">Hide Annotations</button>
         </div>
         
       </div>
@@ -120,6 +121,7 @@
       const ctx = canvas.getContext('2d');
       const canvasWrap = document.getElementById('canvasWrap');
       const spotToolbar = document.getElementById('spotToolbar');
+      let showOverlays = true;
       let baseW = 0, baseH = 0; // native frame size from backend
       const initW = canvas.width, initH = canvas.height; // initial canvas size (shrink target)
       let expanded = false; // false => 640x360, true => full native size
@@ -226,12 +228,33 @@
       }
 
       function updateToolbar(){
+        // Hide toolbar entirely when overlays are hidden
+        if (!showOverlays) {
+          spotToolbar.style.display = 'none';
+          window.__tb_last_id = null;
+          return;
+        }
         const box = selectedBBox();
         if (!box){ spotToolbar.style.display = 'none'; window.__tb_last_id=null; return; }
         spotToolbar.style.display = 'block';
-        // Pin toolbar to fixed corner (top-left of canvasWrap)
-        spotToolbar.style.left = '8px';
-        spotToolbar.style.top = '8px';
+        // Anchor toolbar near selected polygon centroid (clamped within canvas)
+        try {
+          if (baseW && baseH) {
+            const r = bboxToScreen(Math.round(box.x), Math.round(box.y), Math.round(box.x+box.w), Math.round(box.y+box.h));
+            const tbW = Math.min(360, canvas.width - 16);
+            const left = Math.max(8, Math.min(canvas.width - tbW - 8, Math.round(r.x + r.w/2 - 120)));
+            const top = Math.max(8, Math.min(canvas.height - 48, Math.round(r.y - 36)));
+            spotToolbar.style.left = left + 'px';
+            spotToolbar.style.top = top + 'px';
+            spotToolbar.style.maxWidth = tbW + 'px';
+          } else {
+            spotToolbar.style.left = '8px';
+            spotToolbar.style.top = '8px';
+          }
+        } catch(e) {
+          spotToolbar.style.left = '8px';
+          spotToolbar.style.top = '8px';
+        }
         if (window.__tb_last_id === selectedSpotId){ return; }
         window.__tb_last_id = selectedSpotId;
         const safe = (s) => String(s||'').replace(/[&<>]/g, (c)=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]||c));
@@ -320,8 +343,125 @@
         draw();
       }
 
+      function toggleAnno(){
+        showOverlays = !showOverlays;
+        const b = document.getElementById('annoBtn');
+        if (b) b.textContent = showOverlays ? 'Hide Annotations' : 'Show Annotations';
+        // Hide any existing tooltips/popups and pulse indicators when disabling
+        if (!showOverlays) {
+          try { spotToolbar.style.display = 'none'; } catch(e){}
+          try { document.querySelectorAll('.compare-popup').forEach(n=>n.remove()); } catch(e){}
+          try { document.querySelectorAll('.pulse-indicator').forEach(n=>n.remove()); } catch(e){}
+        }
+        draw();
+      }
+
       // Hover feedback to indicate click-to-select
+      // Drag support: move whole polygon or drag vertices
+      let isDragging = false;
+      let dragKind = null; // 'move' | 'vertex'
+      let dragStart = { x: 0, y: 0 };
+      let dragSpotId = null;
+      let dragVertexIndex = -1;
+      let didDrag = false;
+
+      function screenToBase(e){
+        const rect = canvas.getBoundingClientRect();
+        const sx = baseW ? (baseW / canvas.width) : 1;
+        const sy = baseH ? (baseH / canvas.height) : 1;
+        const x = Math.round((e.clientX - rect.left) * sx);
+        const y = Math.round((e.clientY - rect.top) * sy);
+        return { x, y };
+      }
+
+      function baseToScreen(x, y){
+        const sx = baseW ? (canvas.width / baseW) : 1;
+        const sy = baseH ? (canvas.height / baseH) : 1;
+        return { x: x * sx, y: y * sy };
+      }
+
+      function hitVertexForSpot(spot, bx, by){
+        if (!spot || !spot.polygon) return -1;
+        const R = 8; // pixels in screen space
+        for (let i = 0; i < spot.polygon.length; i++){
+          const p = spot.polygon[i];
+          const scr = baseToScreen(p[0], p[1]);
+          const dx = (bx - p[0]) * (canvas.width / (baseW || canvas.width));
+          const dy = (by - p[1]) * (canvas.height / (baseH || canvas.height));
+          // distance in screen pixels
+          const ds = Math.hypot(scr.x - baseToScreen(bx, by).x, scr.y - baseToScreen(bx, by).y);
+          if (ds <= R) return i;
+        }
+        return -1;
+      }
+
+      canvas.addEventListener('mousedown', (e) => {
+        if (!showOverlays) return;
+        const { x, y } = screenToBase(e);
+        const hit = (spots||[]).slice().reverse().find(s => pointInPoly([x,y], s.polygon));
+        // Prefer selected spot if clicking near its vertex
+        const current = selectedSpotId ? (spots||[]).find(sp=>sp.id===selectedSpotId) : null;
+        let vIdx = current ? hitVertexForSpot(current, x, y) : -1;
+        if (current && vIdx >= 0){
+          // Drag a vertex of the selected polygon
+          isDragging = true; dragKind = 'vertex'; dragSpotId = current.id; dragVertexIndex = vIdx; didDrag = false;
+          dragStart = { x, y };
+          e.preventDefault();
+          return;
+        }
+        if (hit){
+          // Drag entire polygon
+          selectedSpotId = hit.id;
+          isDragging = true; dragKind = 'move'; dragSpotId = hit.id; dragVertexIndex = -1; didDrag = false;
+          dragStart = { x, y };
+          updateToolbar();
+          e.preventDefault();
+        } else {
+          // Let click handler create a new spot
+          isDragging = false; dragKind = null; dragSpotId = null; dragVertexIndex = -1; didDrag = false;
+        }
+      });
+
       canvas.addEventListener('mousemove', (e) => {
+        if (!showOverlays) { canvasWrap.style.cursor = 'default'; return; }
+        const rect = canvas.getBoundingClientRect();
+        const sx = baseW ? (baseW / canvas.width) : 1;
+        const sy = baseH ? (baseH / canvas.height) : 1;
+        const x = Math.round((e.clientX - rect.left) * sx);
+        const y = Math.round((e.clientY - rect.top) * sy);
+        if (isDragging && dragSpotId){
+          const s = (spots||[]).find(sp => sp.id === dragSpotId);
+          if (s){
+            if (dragKind === 'move'){
+              const dx = x - dragStart.x;
+              const dy = y - dragStart.y;
+              if (dx || dy){ didDrag = true; }
+              s.polygon = s.polygon.map(p => [p[0] + dx, p[1] + dy]);
+              dragStart = { x, y };
+              renderZonesView(); draw(); e.preventDefault(); return;
+            } else if (dragKind === 'vertex' && dragVertexIndex >= 0){
+              const before = s.polygon[dragVertexIndex];
+              if (before[0] !== x || before[1] !== y){ didDrag = true; }
+              s.polygon[dragVertexIndex] = [x, y];
+              renderZonesView(); draw(); e.preventDefault(); return;
+            }
+          }
+        }
+        const hit = (spots||[]).slice().reverse().find(s => pointInPoly([x,y], s.polygon));
+        const newHover = hit ? hit.id : null;
+        if (newHover !== hoverSpotId){
+          hoverSpotId = newHover;
+          canvasWrap.style.cursor = hoverSpotId ? 'pointer' : 'default';
+          draw();
+        }
+      });
+
+      window.addEventListener('mouseup', (e) => {
+        if (!isDragging) return;
+        isDragging = false; dragKind = null; dragSpotId = null; dragVertexIndex = -1;
+      });
+      canvas.addEventListener('mousemove', (e) => {
+        if (!showOverlays) { canvasWrap.style.cursor = 'default'; return; }
         const rect = canvas.getBoundingClientRect();
         const sx = baseW ? (baseW / canvas.width) : 1;
         const sy = baseH ? (baseH / canvas.height) : 1;
@@ -343,8 +483,8 @@
         const img = new Image();
         img.onload = () => {
           ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-          // overlay spots as rectangles
-          if (spots && spots.length) {
+          // overlay spots as rectangles (respect visibility toggle)
+          if (showOverlays && spots && spots.length) {
             ctx.strokeStyle = '#44aaff'; ctx.lineWidth = 2; ctx.fillStyle = 'rgba(68,170,255,0.12)';
             for (const s of spots) {
               if (!s.polygon || s.polygon.length < 4) continue;
@@ -357,6 +497,16 @@
               if (s.id === selectedSpotId) {
                 ctx.strokeStyle = '#ffaa00'; ctx.lineWidth = 2; ctx.setLineDash([6,4]);
                 ctx.stroke(); ctx.setLineDash([]); ctx.strokeStyle = '#44aaff';
+                // Draw vertex handles for selected polygon
+                try {
+                  ctx.fillStyle = '#ffaa00';
+                  for (let i=0;i<s.polygon.length;i++){
+                    const p = s.polygon[i];
+                    const vx = p[0]*sx, vy = p[1]*sy;
+                    ctx.beginPath(); ctx.arc(vx, vy, 4, 0, Math.PI*2); ctx.fill();
+                  }
+                  ctx.fillStyle = 'rgba(68,170,255,0.12)';
+                } catch(e){}
               }
             }
           }
@@ -366,11 +516,13 @@
       }
 
       canvas.addEventListener('click', async (e) => {
-        const rect = canvas.getBoundingClientRect();
-        const sx = baseW ? (baseW / canvas.width) : 1;
-        const sy = baseH ? (baseH / canvas.height) : 1;
-        const x = Math.round((e.clientX - rect.left) * sx);
-        const y = Math.round((e.clientY - rect.top) * sy);
+        if (!showOverlays) return;
+        const { x, y } = screenToBase(e);
+        if (didDrag){
+          // Suppress click action if a drag just happened to avoid accidental create/select
+          didDrag = false;
+          return;
+        }
         const hit = (spots||[]).slice().reverse().find(s => pointInPoly([x,y], s.polygon));
         if (hit) {
           selectedSpotId = hit.id;
@@ -387,6 +539,7 @@
       });
 
       document.addEventListener('keydown', (e) => {
+        if (!showOverlays) return;
         if (!selectedSpotId) return;
         const s = spots.find(sp => sp.id === selectedSpotId);
         if (!s) return;
@@ -473,6 +626,7 @@
       }
 
       function showSpotChangeEffect(st){
+        if (!showOverlays) return;
         // st has x1,y1,x2,y2 from /api/spot_stats
         const rect = bboxToScreen(st.x1, st.y1, st.x2, st.y2);
         if (!rect || rect.w <= 4 || rect.h <= 4) return;
