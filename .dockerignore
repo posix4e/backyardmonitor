@@ -1,0 +1,14 @@
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.git
+.gitignore
+.server.log
+.server.pid
+data
+bm/data.o
+backyardmonitor.egg-info
+AGENTS.md
+

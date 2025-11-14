@@ -1,0 +1,26 @@
+services:
+  backyardmonitor:
+    build: .
+    image: backyardmonitor:local
+    container_name: backyardmonitor
+    ports:
+      - "8080:8080"
+    environment:
+      # Set your RTSP URL here or in an .env file you mount below
+      - RTSP_URL=${RTSP_URL}
+      - DATA_DIR=/data
+      - AUTO_START=${AUTO_START:-true}
+      - STORE_THUMBS=${STORE_THUMBS:-true}
+      - STORE_CROPS=${STORE_CROPS:-false}
+      - STORE_FULL_FRAMES=${STORE_FULL_FRAMES:-false}
+      - JPEG_QUALITY=${JPEG_QUALITY:-80}
+      - RETAIN_DAYS=${RETAIN_DAYS:-3}
+      - MAX_EVENTS=${MAX_EVENTS:-5000}
+      - MAX_STORAGE_GB=${MAX_STORAGE_GB:-10}
+      - PHASH_MIN_BITS=${PHASH_MIN_BITS:-14}
+      - PHASH_STABLE_MS=${PHASH_STABLE_MS:-1200}
+    volumes:
+      - ./data:/data
+      - ./.env:/app/.env:ro
+    restart: unless-stopped
+
