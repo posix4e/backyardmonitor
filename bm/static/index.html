@@ -44,6 +44,7 @@
           <button onclick="saveZones()">Save Zones</button>
           <button onclick="clearSpots()">Clear Spots</button>
           <button id="sizeBtn" onclick="toggleSize()">Expand</button>
+          <button id="annoBtn" onclick="toggleAnno()">Hide Annotations</button>
         </div>
         
       </div>
@@ -120,6 +121,7 @@
       const ctx = canvas.getContext('2d');
       const canvasWrap = document.getElementById('canvasWrap');
       const spotToolbar = document.getElementById('spotToolbar');
+      let showOverlays = true;
       let baseW = 0, baseH = 0; // native frame size from backend
       const initW = canvas.width, initH = canvas.height; // initial canvas size (shrink target)
       let expanded = false; // false => 640x360, true => full native size
@@ -226,6 +228,12 @@
       }
 
       function updateToolbar(){
+        // Hide toolbar entirely when overlays are hidden
+        if (!showOverlays) {
+          spotToolbar.style.display = 'none';
+          window.__tb_last_id = null;
+          return;
+        }
         const box = selectedBBox();
         if (!box){ spotToolbar.style.display = 'none'; window.__tb_last_id=null; return; }
         spotToolbar.style.display = 'block';
@@ -320,8 +328,22 @@
         draw();
       }
 
+      function toggleAnno(){
+        showOverlays = !showOverlays;
+        const b = document.getElementById('annoBtn');
+        if (b) b.textContent = showOverlays ? 'Hide Annotations' : 'Show Annotations';
+        // Hide any existing tooltips/popups and pulse indicators when disabling
+        if (!showOverlays) {
+          try { spotToolbar.style.display = 'none'; } catch(e){}
+          try { document.querySelectorAll('.compare-popup').forEach(n=>n.remove()); } catch(e){}
+          try { document.querySelectorAll('.pulse-indicator').forEach(n=>n.remove()); } catch(e){}
+        }
+        draw();
+      }
+
       // Hover feedback to indicate click-to-select
       canvas.addEventListener('mousemove', (e) => {
+        if (!showOverlays) { canvasWrap.style.cursor = 'default'; return; }
         const rect = canvas.getBoundingClientRect();
         const sx = baseW ? (baseW / canvas.width) : 1;
         const sy = baseH ? (baseH / canvas.height) : 1;
@@ -343,8 +365,8 @@
         const img = new Image();
         img.onload = () => {
           ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-          // overlay spots as rectangles
-          if (spots && spots.length) {
+          // overlay spots as rectangles (respect visibility toggle)
+          if (showOverlays && spots && spots.length) {
             ctx.strokeStyle = '#44aaff'; ctx.lineWidth = 2; ctx.fillStyle = 'rgba(68,170,255,0.12)';
             for (const s of spots) {
               if (!s.polygon || s.polygon.length < 4) continue;
@@ -366,6 +388,7 @@
       }
 
       canvas.addEventListener('click', async (e) => {
+        if (!showOverlays) return;
         const rect = canvas.getBoundingClientRect();
         const sx = baseW ? (baseW / canvas.width) : 1;
         const sy = baseH ? (baseH / canvas.height) : 1;
@@ -387,6 +410,7 @@
       });
 
       document.addEventListener('keydown', (e) => {
+        if (!showOverlays) return;
         if (!selectedSpotId) return;
         const s = spots.find(sp => sp.id === selectedSpotId);
         if (!s) return;
@@ -473,6 +497,7 @@
       }
 
       function showSpotChangeEffect(st){
+        if (!showOverlays) return;
         // st has x1,y1,x2,y2 from /api/spot_stats
         const rect = bboxToScreen(st.x1, st.y1, st.x2, st.y2);
         if (!rect || rect.w <= 4 || rect.h <= 4) return;
