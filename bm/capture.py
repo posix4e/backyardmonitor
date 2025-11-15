@@ -3,7 +3,6 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional, Tuple
 
 import cv2
@@ -22,10 +21,14 @@ class CaptureState:
 
 
 class VideoCaptureWorker:
-    def __init__(self, source: str, max_fps: float | None = None,
-                 idle_resync_ms: int = 2500,
-                 fail_resync_count: int = 10,
-                 reopen_delay_ms: int = 300):
+    def __init__(
+        self,
+        source: str,
+        max_fps: float | None = None,
+        idle_resync_ms: int = 2500,
+        fail_resync_count: int = 10,
+        reopen_delay_ms: int = 300,
+    ):
         self.source = source
         self.max_fps = float(max_fps) if (max_fps is not None and max_fps > 0) else 0.0
         self.idle_resync_ms = int(idle_resync_ms)
@@ -85,7 +88,7 @@ class VideoCaptureWorker:
                 )
                 # Optional GPU HW acceleration via FFmpeg if available
                 try:
-                    hwaccel = (os.getenv("HWACCEL", "").strip().lower())
+                    hwaccel = os.getenv("HWACCEL", "").strip().lower()
                     hwdev = os.getenv("HWACCEL_DEVICE", "").strip()
                     if hwaccel in {"cuda", "cuvid", "vaapi"}:
                         if hwaccel == "cuvid":
@@ -100,7 +103,9 @@ class VideoCaptureWorker:
                 existing = os.getenv("OPENCV_FFMPEG_CAPTURE_OPTIONS")
                 if existing and existing != opts:
                     # Simple merge without duplicates
-                    kv = {tuple(p.split(";", 1)) for p in existing.split("|") if ";" in p}
+                    kv = {
+                        tuple(p.split(";", 1)) for p in existing.split("|") if ";" in p
+                    }
                     for part in opts.split("|"):
                         if ";" in part:
                             kv.add(tuple(part.split(";", 1)))
@@ -187,9 +192,8 @@ class VideoCaptureWorker:
                     consecutive_fail += 1
                     # Resync on too many consecutive failures or idle
                     idle_ms = (ts - last_good_ts) * 1000.0
-                    if (
-                        consecutive_fail >= max(1, self.fail_resync_count)
-                        or (self.idle_resync_ms > 0 and idle_ms >= self.idle_resync_ms)
+                    if consecutive_fail >= max(1, self.fail_resync_count) or (
+                        self.idle_resync_ms > 0 and idle_ms >= self.idle_resync_ms
                     ):
                         try:
                             log.info(

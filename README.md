@@ -1,5 +1,8 @@
 # Backyard Monitor (Rewrite)
 
+<!-- Replace YOUR_GH_USERNAME and YOUR_GIST_ID with your values -->
+![Deployed](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/YOUR_GH_USERNAME/YOUR_GIST_ID/raw/badge.json)
+
 A minimal single-process web server to:
 - Draw parking spot polygons on a live frame
 - Start/stop a background capture loop
@@ -33,6 +36,13 @@ Recommended: uv + systemd (no Docker). See `DEPLOY.md` for the unit file and a o
 Quick run locally:
 - `uv sync`
 - `uv run backyardmonitor --reload --port 8080 --env-file .env`
+
+## Pre-commit Hook
+
+- Configure Black to run on commits:
+  - Install once: `uvx pre-commit install` (or `pip install pre-commit && pre-commit install`)
+  - Run on all files: `uvx pre-commit run --all-files`
+  - Config lives in `.pre-commit-config.yaml`; Black options are in `pyproject.toml` under `[tool.black]`.
 
 ## Calibrate
 
@@ -68,3 +78,20 @@ Use the Data panel → Images to view summary and cleanup orphans. You can also 
 
 - RTSP is opened with the FFmpeg backend and `rtsp_transport=tcp` (plus a 5s socket timeout) by default to reduce packet loss and stream breakage.
 - The capture loop drops likely garbage frames (all-black/white or extremely low-variance grey) and resyncs after consecutive bad reads or idle periods. This prevents corrupt frames from propagating into event detection.
+### Deployed version badge
+
+To display the version running on your Proxmox (LXC 101, Docker) instance exposed at `monitor.newman.family`:
+
+- Create a secret Gist with a file named `badge.json` and copy the Gist ID.
+- Add repository secrets:
+  - `DEPLOY_BADGE_GIST_ID` – the Gist ID
+  - `DEPLOY_BADGE_GIST_TOKEN` – a GitHub token with `gist` scope
+- The workflow `.github/workflows/deployed-badge.yml` polls `https://monitor.newman.family/api/version` every 10 minutes and updates the Gist.
+- Add this badge to the top of the README (replace placeholders):
+
+  `![Deployed](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/YOUR_GH_USERNAME/YOUR_GIST_ID/raw/badge.json)`
+
+Notes:
+- The backend now serves `GET /api/version` with `{ name, version, build }`.
+- Set `GIT_SHA` (or `APP_BUILD`) in your container env to include a short commit in the badge message.
+- If Cloudflare sits in front, ensure `/api/version` is reachable and not cached or blocked by WAF.

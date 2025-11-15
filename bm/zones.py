@@ -17,6 +17,10 @@ class Spot:
     # Optional per-spot sensitivity overrides
     min_bits: int | None = None
     stable_ms: int | None = None
+    # Optional semantic category (e.g., 'gate', 'parking')
+    category: str | None = None
+    # Optional grouping key to treat multiple spots as one logical unit
+    group_id: str | None = None
 
 
 @dataclass
@@ -39,6 +43,10 @@ class Zones:
                 d.pop("min_bits", None)
             if d.get("stable_ms") is None:
                 d.pop("stable_ms", None)
+            if not d.get("category"):
+                d.pop("category", None)
+            if not d.get("group_id"):
+                d.pop("group_id", None)
             spots_out.append(d)
         return {"gate": gate_out, "spots": spots_out}
 
@@ -79,6 +87,8 @@ class Zones:
                     polygon=[tuple(p) for p in s.get("polygon", [])],
                     min_bits=s.get("min_bits"),
                     stable_ms=s.get("stable_ms"),
+                    category=s.get("category"),
+                    group_id=s.get("group_id"),
                 )
             )
         # Ignore any legacy 'grid' key if present to reduce confusion

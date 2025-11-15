@@ -1,14 +1,12 @@
 from __future__ import annotations
-
-import os
 import time
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Response
-import logging
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from importlib.metadata import PackageNotFoundError, version as pkg_version
 
 from .config import Settings
 from .capture import VideoCaptureWorker
@@ -38,9 +36,7 @@ class AppState:
         # Cached JPEG to avoid re-encoding every request
         self._last_jpg: bytes | None = None
         self._last_jpg_ts: float = 0.0
-        # Heuristic tracking for low-variance (grey) frames
-        self._lowvar_count: int = 0
-        self._last_restart_ts: float = 0.0
+        # Previous frame-wide signature removed; we no longer suppress global-lighting changes
 
     def ensure_capture(self) -> None:
         if not self.settings.rtsp_url:
@@ -137,6 +133,17 @@ def create_app() -> FastAPI:
             "events": state.events.recent(20),
         }
 
+    @app.get("/api/version", response_class=JSONResponse)
+    async def api_version():
+        try:
+            ver = pkg_version("backyardmonitor")
+        except PackageNotFoundError:
+            ver = "0.0.0"
+        import os
+
+        build = os.getenv("GIT_SHA") or os.getenv("APP_BUILD") or ""
+        return {"name": "backyardmonitor", "version": ver, "build": build}
+
     @app.get("/api/spot_stats", response_class=JSONResponse)
     async def api_spot_stats():
         import numpy as np
@@ -146,207 +153,607 @@ def create_app() -> FastAPI:
         now = time.time()
         latest = state.capture.latest() if state.capture else None
         frame = latest[0] if latest else None
+
+        method = (state.settings.detector_method or "phash").lower()
+
+        def _category_params(category: str | None):
+            # Default unlabeled spots to 'parking' semantics
+            c = (category or "parking").strip().lower()
+            if c == "gate":
+                return {
+                    "stable_ms": int(state.settings.category_gate_stable_ms or 0),
+                    "phash_min_bits": int(
+                        state.settings.category_gate_phash_min_bits or 0
+                    ),
+                    "roi_diff_threshold": float(
+                        state.settings.category_gate_roi_diff_threshold or 0.0
+                    ),
+                    "roi_diff_min_pixels": int(
+                        state.settings.category_gate_min_pixels
+                        or state.settings.roi_diff_min_pixels
+                        or 0
+                    ),
+                    "cooldown_ms": int(
+                        state.settings.category_gate_cooldown_ms
+                        or state.settings.roi_diff_cooldown_ms
+                        or 0
+                    ),
+                    "flow_mag_min": float(
+                        state.settings.category_gate_flow_mag_min or 0.0
+                    ),
+                }
+            elif c == "parking":
+                return {
+                    "stable_ms": int(state.settings.category_parking_stable_ms or 0),
+                    "phash_min_bits": int(
+                        state.settings.category_parking_phash_min_bits or 0
+                    ),
+                    "roi_diff_threshold": float(
+                        state.settings.category_parking_roi_diff_threshold or 0.0
+                    ),
+                    "roi_diff_min_pixels": int(
+                        state.settings.category_parking_min_pixels
+                        or state.settings.roi_diff_min_pixels
+                        or 0
+                    ),
+                    "cooldown_ms": int(
+                        state.settings.category_parking_cooldown_ms
+                        or state.settings.roi_diff_cooldown_ms
+                        or 0
+                    ),
+                    "flow_mag_min": 0.0,
+                }
+            elif c == "road":
+                return {
+                    "stable_ms": int(state.settings.category_road_stable_ms or 0),
+                    "phash_min_bits": int(
+                        state.settings.category_road_phash_min_bits or 0
+                    ),
+                    "roi_diff_threshold": float(
+                        state.settings.category_road_roi_diff_threshold or 0.0
+                    ),
+                    "roi_diff_min_pixels": int(
+                        state.settings.category_road_min_pixels
+                        or state.settings.roi_diff_min_pixels
+                        or 0
+                    ),
+                    "cooldown_ms": int(
+                        state.settings.category_road_cooldown_ms
+                        or state.settings.roi_diff_cooldown_ms
+                        or 0
+                    ),
+                    "flow_mag_min": float(
+                        state.settings.category_road_flow_mag_min or 0.0
+                    ),
+                }
+            # Fallback to global
+            return {
+                "stable_ms": int(state.settings.phash_stable_ms or 0),
+                "phash_min_bits": int(state.settings.phash_min_bits or 0),
+                "roi_diff_threshold": float(state.settings.roi_diff_threshold or 0.02),
+                "roi_diff_min_pixels": int(state.settings.roi_diff_min_pixels or 0),
+                "cooldown_ms": int(state.settings.roi_diff_cooldown_ms or 0),
+                "flow_mag_min": 0.0,
+            }
+
+        def _hamming(a: str | None, b: str | None) -> int:
+            if not a or not b or len(a) != len(b):
+                return 999
+            return sum(1 for i in range(len(a)) if a[i] != b[i])
+
+        def _roi_phash(img) -> str | None:
+            try:
+                g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                g = cv2.GaussianBlur(g, (3, 3), 0)
+                small = cv2.resize(g, (32, 32), interpolation=cv2.INTER_AREA)
+                smallf = small.astype(np.float32)
+                dct = cv2.dct(smallf)
+                dct_low = dct[:8, :8].copy()
+                vals = dct_low.flatten()
+                median = (
+                    float(np.median(vals[1:]))
+                    if len(vals) > 1
+                    else float(np.median(vals))
+                )
+                bits = (vals > median).astype(np.uint8)
+                return "".join("1" if b else "0" for b in bits)
+            except Exception:
+                return None
+
         stats = []
         for s in zones.spots:
-            # compute bbox and signature if we have a frame
             xs = [p[0] for p in s.polygon] or [0]
             ys = [p[1] for p in s.polygon] or [0]
             x1, y1 = max(0, int(min(xs))), max(0, int(min(ys)))
             x2, y2 = int(max(xs)), int(max(ys))
             sig = None
+            rec = state.spot_tracker.get(s.id)
             if frame is not None and x2 > x1 and y2 > y1:
                 crop = frame[
                     max(0, y1) : min(frame.shape[0], y2),
                     max(0, x1) : min(frame.shape[1], x2),
                 ]
                 if crop.size > 0:
-                    # DCT-based pHash (64 bits) with slight blur for robustness
-                    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-                    small = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA)
-                    smallf = small.astype(np.float32)
-                    dct = cv2.dct(smallf)
-                    dct_low = dct[:8, :8].copy()
-                    vals = dct_low.flatten()
-                    vals_no_dc = vals[1:]
-                    median = float(np.median(vals_no_dc))
-                    bits = (vals > median).astype(np.uint8)
-                    sig = "".join("1" if b else "0" for b in bits)
-            rec = state.spot_tracker.get(s.id)
-
-            def _hamming(a: str | None, b: str | None) -> int:
-                if not a or not b or len(a) != len(b):
-                    return 999
-                return sum(1 for i in range(len(a)) if a[i] != b[i])
-
-            if sig is not None:
-                if not rec:
-                    state.spot_tracker[s.id] = {"sig": sig, "since": now}
-                    rec = state.spot_tracker[s.id]
-                elif rec.get("sig") != sig:
-                    prev_sig = str(rec.get("sig") or "")
-                    prev_since = float(rec.get("since") or now)
-                    # hysteresis and threshold (per-spot overrides take precedence)
-                    spot_min_bits = getattr(s, "min_bits", None)
-                    spot_stable_ms = getattr(s, "stable_ms", None)
-                    min_bits = int(
-                        spot_min_bits
-                        if spot_min_bits is not None
-                        else (state.settings.phash_min_bits or 0)
-                    )
-                    stable_ms = int(
-                        spot_stable_ms
-                        if spot_stable_ms is not None
-                        else (state.settings.phash_stable_ms or 0)
-                    )
-                    cand_sig = rec.get("cand_sig")
-                    cand_since = float(rec.get("cand_since") or 0)
-                    if cand_sig != sig:
-                        rec["cand_sig"] = sig
-                        rec["cand_since"] = now
-                        try:
-                            logging.getLogger("uvicorn.error").debug(
-                                f"spot={s.id} candidate start delta={_hamming(prev_sig, sig)} bits"
+                    # Always compute a pHash for UI change visualization
+                    sig = _roi_phash(crop)
+                    if method == "roi_diff":
+                        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                        # initialize or update baseline
+                        if not rec or rec.get("baseline") is None:
+                            state.spot_tracker[s.id] = rec = {
+                                "baseline": gray.astype(np.float32),
+                                "since": now,
+                            }
+                        base = rec.get("baseline")
+                        if isinstance(base, np.ndarray) and base.size == gray.size:
+                            base8 = cv2.convertScaleAbs(base)
+                            diff = cv2.absdiff(gray, base8)
+                            # ROI-diff thresholding and state machine
+                            cp = _category_params(getattr(s, "category", None))
+                            thr_ratio = float(
+                                cp.get("roi_diff_threshold")
+                                or state.settings.roi_diff_threshold
+                                or 0.02
                             )
-                        except Exception:
-                            pass
+                            t = int(max(1, min(255, round(255.0 * thr_ratio))))
+                            _, mask = cv2.threshold(diff, t, 255, cv2.THRESH_BINARY)
+                            k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+                            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+                            changed_pixels = int(cv2.countNonZero(mask))
+                            ratio = float(changed_pixels) / float(
+                                mask.size if mask.size else 1
+                            )
+                            # State machine with hysteresis
+                            spot_stable_ms = getattr(s, "stable_ms", None)
+                            stable_ms = int(
+                                spot_stable_ms
+                                if spot_stable_ms is not None
+                                else cp.get(
+                                    "stable_ms", state.settings.phash_stable_ms or 0
+                                )
+                            )
+                            min_pixels = int(
+                                cp.get("roi_diff_min_pixels")
+                                or state.settings.roi_diff_min_pixels
+                                or 0
+                            )
+                            enter = ratio >= thr_ratio and changed_pixels >= max(
+                                0, min_pixels
+                            )
+                            exit_thr = max(0.0, min(thr_ratio * 0.6, thr_ratio - 0.02))
+                            leave = ratio <= exit_thr or changed_pixels < max(
+                                0, int(min_pixels * 0.7)
+                            )
+                            state_key = str(rec.get("state") or "empty")
+                            # track candidates
+                            enter_since = float(rec.get("cand_enter_since") or 0)
+                            exit_since = float(rec.get("cand_exit_since") or 0)
+                            if state_key == "empty":
+                                if enter:
+                                    if not enter_since:
+                                        rec["cand_enter_since"] = now
+                                    elif ((now - enter_since) * 1000.0) >= stable_ms:
+                                        # cooldown
+                                        try:
+                                            cd_ms = int(
+                                                cp.get("cooldown_ms")
+                                                or state.settings.roi_diff_cooldown_ms
+                                                or 0
+                                            )
+                                        except Exception:
+                                            cd_ms = 0
+                                        last_evt_ts = float(
+                                            rec.get("last_evt_ts") or 0.0
+                                        )
+                                        if not (
+                                            cd_ms > 0
+                                            and last_evt_ts
+                                            and ((now - last_evt_ts) * 1000.0) < cd_ms
+                                        ):
+                                            # Optional flow requirement
+                                            ok_flow = True
+                                            try:
+                                                req = float(
+                                                    cp.get("flow_mag_min") or 0.0
+                                                )
+                                                if req > 0.0:
+                                                    prev_g = rec.get("prev_gray")
+                                                    if (
+                                                        isinstance(prev_g, np.ndarray)
+                                                        and prev_g.shape == gray.shape
+                                                    ):
+                                                        flow = cv2.calcOpticalFlowFarneback(
+                                                            prev_g,
+                                                            gray,
+                                                            None,
+                                                            0.5,
+                                                            1,
+                                                            15,
+                                                            3,
+                                                            5,
+                                                            1.2,
+                                                            0,
+                                                        )
+                                                        mag = np.sqrt(
+                                                            flow[..., 0] ** 2
+                                                            + flow[..., 1] ** 2
+                                                        )
+                                                        ok_flow = (
+                                                            float(np.mean(mag)) >= req
+                                                        )
+                                            except Exception:
+                                                ok_flow = True
+                                            # Low-variance guard
+                                            if ok_flow:
+                                                try:
+                                                    small = cv2.resize(
+                                                        gray,
+                                                        (64, 36),
+                                                        interpolation=cv2.INTER_AREA,
+                                                    )
+                                                    mean = float(np.mean(small))
+                                                    std = float(np.std(small))
+                                                    if (mean < 6.0 or mean > 245.0) or (
+                                                        std < 6.0
+                                                    ):
+                                                        ok_flow = False
+                                                except Exception:
+                                                    pass
+                                            if ok_flow:
+                                                # emit enter event
+                                                try:
+                                                    ts_ms = int(now * 1000)
+                                                    base_name = f"evt_{ts_ms}_{s.id}"
+                                                    full_path = (
+                                                        state.frames_dir
+                                                        / f"{base_name}_full.jpg"
+                                                    )
+                                                    crop_path = (
+                                                        state.frames_dir
+                                                        / f"{base_name}_crop.jpg"
+                                                    )
+                                                    thumb_path = (
+                                                        state.frames_dir
+                                                        / f"{base_name}_thumb.jpg"
+                                                    )
+                                                    params = [
+                                                        int(cv2.IMWRITE_JPEG_QUALITY),
+                                                        int(
+                                                            state.settings.jpeg_quality
+                                                            or 80
+                                                        ),
+                                                    ]
+                                                    if state.settings.store_full_frames:
+                                                        try:
+                                                            cv2.imwrite(
+                                                                str(full_path),
+                                                                frame,
+                                                                params,
+                                                            )
+                                                        except Exception:
+                                                            pass
+                                                    if state.settings.store_crops:
+                                                        try:
+                                                            cv2.imwrite(
+                                                                str(crop_path),
+                                                                crop,
+                                                                params,
+                                                            )
+                                                        except Exception:
+                                                            pass
+                                                    if state.settings.store_thumbs:
+                                                        try:
+                                                            h_c, w_c = crop.shape[:2]
+                                                            if w_c > 0 and h_c > 0:
+                                                                new_w = 240
+                                                                new_h = max(
+                                                                    1,
+                                                                    int(
+                                                                        h_c
+                                                                        * (new_w / w_c)
+                                                                    ),
+                                                                )
+                                                                thumb = cv2.resize(
+                                                                    crop,
+                                                                    (new_w, new_h),
+                                                                    interpolation=cv2.INTER_AREA,
+                                                                )
+                                                                cv2.imwrite(
+                                                                    str(thumb_path),
+                                                                    thumb,
+                                                                    params,
+                                                                )
+                                                        except Exception:
+                                                            pass
+                                                    meta = {
+                                                        "spot_id": s.id,
+                                                        "ratio": ratio,
+                                                        "method": "roi_diff",
+                                                        "state": "enter",
+                                                    }
+                                                    if (
+                                                        state.settings.store_full_frames
+                                                        and full_path.exists()
+                                                    ):
+                                                        meta["image_full"] = (
+                                                            full_path.name
+                                                        )
+                                                    if (
+                                                        state.settings.store_crops
+                                                        and crop_path.exists()
+                                                    ):
+                                                        meta["image_crop"] = (
+                                                            crop_path.name
+                                                        )
+                                                    if (
+                                                        state.settings.store_thumbs
+                                                        and thumb_path.exists()
+                                                    ):
+                                                        meta["image_thumb"] = (
+                                                            thumb_path.name
+                                                        )
+                                                    state.events.add(
+                                                        "spot_change", meta
+                                                    )
+                                                except Exception:
+                                                    pass
+                                                rec["state"] = "occupied"
+                                                rec["since"] = now
+                                                rec["last_evt_ts"] = now
+                                                rec.pop("cand_enter_since", None)
+                            else:  # occupied
+                                if leave:
+                                    if not exit_since:
+                                        rec["cand_exit_since"] = now
+                                    elif ((now - exit_since) * 1000.0) >= max(
+                                        300, int(stable_ms * 0.7)
+                                    ):
+                                        # emit exit event
+                                        try:
+                                            ts_ms = int(now * 1000)
+                                            base_name = f"evt_{ts_ms}_{s.id}"
+                                            full_path = (
+                                                state.frames_dir
+                                                / f"{base_name}_full.jpg"
+                                            )
+                                            crop_path = (
+                                                state.frames_dir
+                                                / f"{base_name}_crop.jpg"
+                                            )
+                                            thumb_path = (
+                                                state.frames_dir
+                                                / f"{base_name}_thumb.jpg"
+                                            )
+                                            params = [
+                                                int(cv2.IMWRITE_JPEG_QUALITY),
+                                                int(state.settings.jpeg_quality or 80),
+                                            ]
+                                            if state.settings.store_full_frames:
+                                                try:
+                                                    cv2.imwrite(
+                                                        str(full_path), frame, params
+                                                    )
+                                                except Exception:
+                                                    pass
+                                            if state.settings.store_crops:
+                                                try:
+                                                    cv2.imwrite(
+                                                        str(crop_path), crop, params
+                                                    )
+                                                except Exception:
+                                                    pass
+                                            if state.settings.store_thumbs:
+                                                try:
+                                                    h_c, w_c = crop.shape[:2]
+                                                    if w_c > 0 and h_c > 0:
+                                                        new_w = 240
+                                                        new_h = max(
+                                                            1, int(h_c * (new_w / w_c))
+                                                        )
+                                                        thumb = cv2.resize(
+                                                            crop,
+                                                            (new_w, new_h),
+                                                            interpolation=cv2.INTER_AREA,
+                                                        )
+                                                        cv2.imwrite(
+                                                            str(thumb_path),
+                                                            thumb,
+                                                            params,
+                                                        )
+                                                except Exception:
+                                                    pass
+                                            meta = {
+                                                "spot_id": s.id,
+                                                "ratio": ratio,
+                                                "method": "roi_diff",
+                                                "state": "exit",
+                                            }
+                                            if (
+                                                state.settings.store_full_frames
+                                                and full_path.exists()
+                                            ):
+                                                meta["image_full"] = full_path.name
+                                            if (
+                                                state.settings.store_crops
+                                                and crop_path.exists()
+                                            ):
+                                                meta["image_crop"] = crop_path.name
+                                            if (
+                                                state.settings.store_thumbs
+                                                and thumb_path.exists()
+                                            ):
+                                                meta["image_thumb"] = thumb_path.name
+                                            state.events.add("spot_change", meta)
+                                        except Exception:
+                                            pass
+                                        rec["state"] = "empty"
+                                        rec["since"] = now
+                                        rec["last_evt_ts"] = now
+                                        rec.pop("cand_exit_since", None)
+                            # update baseline after diff
+                            try:
+                                cv2.accumulateWeighted(
+                                    gray,
+                                    base,
+                                    float(state.settings.roi_diff_alpha or 0.05),
+                                )
+                            except Exception:
+                                pass
+                            # keep last gray for optional flow checks
+                            try:
+                                rec["prev_gray"] = gray
+                            except Exception:
+                                pass
                     else:
-                        stable = (
-                            ((now - cand_since) * 1000.0) >= stable_ms
-                            if stable_ms > 0
-                            else True
-                        )
-                        delta_bits = _hamming(prev_sig, sig)
-                        if not stable:
-                            try:
-                                logging.getLogger("uvicorn.error").info(
-                                    f"spot={s.id} status=unstable delta={delta_bits} elapsed_ms={(now - cand_since)*1000:.0f} need_ms={stable_ms}"
+                        # pHash detection path (previous behavior sans global-lighting suppression)
+                        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+                        small = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA)
+                        smallf = small.astype(np.float32)
+                        dct = cv2.dct(smallf)
+                        dct_low = dct[:8, :8].copy()
+                        vals = dct_low.flatten()
+                        vals_no_dc = vals[1:]
+                        median = float(np.median(vals_no_dc))
+                        bits = (vals > median).astype(np.uint8)
+                        sig = "".join("1" if b else "0" for b in bits)
+                        if sig is not None:
+                            if not rec:
+                                state.spot_tracker[s.id] = {"sig": sig, "since": now}
+                                rec = state.spot_tracker[s.id]
+                            elif rec.get("sig") != sig:
+                                prev_sig = str(rec.get("sig") or "")
+                                spot_min_bits = getattr(s, "min_bits", None)
+                                spot_stable_ms = getattr(s, "stable_ms", None)
+                                cp = _category_params(getattr(s, "category", None))
+                                min_bits = int(
+                                    spot_min_bits
+                                    if spot_min_bits is not None
+                                    else (
+                                        cp.get("phash_min_bits")
+                                        or state.settings.phash_min_bits
+                                        or 0
+                                    )
                                 )
-                            except Exception:
-                                pass
-                        if stable and delta_bits >= min_bits:
-                            # Before accepting, reject low-variance (grey/blank) crops to avoid false events
-                            try:
-                                import numpy as _np
-                                import cv2 as _cv2
-
-                                def _is_low_detail(img) -> bool:
-                                    if img is None:
-                                        return True
-                                    if img.size == 0:
-                                        return True
-                                    g = _cv2.cvtColor(img, _cv2.COLOR_BGR2GRAY)
-                                    small = _cv2.resize(g, (64, 36), interpolation=_cv2.INTER_AREA)
-                                    mean = float(_np.mean(small))
-                                    std = float(_np.std(small))
-                                    # Stricter than capture-level: weed out bland crops
-                                    if mean < 6.0 or mean > 245.0:
-                                        return True
-                                    if std < 6.0:
-                                        return True
-                                    zeros = float((small <= 2).sum())
-                                    highs = float((small >= 253).sum())
-                                    total = float(small.size) if small.size else 1.0
-                                    if (zeros / total) > 0.98 or (highs / total) > 0.98:
-                                        return True
-                                    return False
-
-                                lowvar = False
-                                if "crop" in locals() and crop is not None and crop.size > 0:
-                                    lowvar = _is_low_detail(crop)
+                                stable_ms = int(
+                                    spot_stable_ms
+                                    if spot_stable_ms is not None
+                                    else (
+                                        cp.get("stable_ms")
+                                        or state.settings.phash_stable_ms
+                                        or 0
+                                    )
+                                )
+                                cand_sig = rec.get("cand_sig")
+                                cand_since = float(rec.get("cand_since") or 0)
+                                if cand_sig != sig:
+                                    rec["cand_sig"] = sig
+                                    rec["cand_since"] = now
                                 else:
-                                    lowvar = _is_low_detail(frame)
-                            except Exception:
-                                lowvar = False
-                            if lowvar:
-                                try:
-                                    logging.getLogger("uvicorn.error").info(
-                                        f"spot={s.id} status=reject_lowvar delta={delta_bits}"
+                                    stable = (
+                                        (((now - cand_since) * 1000.0) >= stable_ms)
+                                        if stable_ms > 0
+                                        else True
                                     )
-                                except Exception:
-                                    pass
-                                # Do not accept or update signature; keep candidate to re-evaluate later
-                                continue
-                            duration_prev = max(0.0, now - prev_since)
-                            try:
-                                import cv2, os
-
-                                ts_ms = int(now * 1000)
-                                base = f"evt_{ts_ms}_{s.id}"
-                                full_path = state.frames_dir / f"{base}_full.jpg"
-                                crop_path = state.frames_dir / f"{base}_crop.jpg"
-                                thumb_path = state.frames_dir / f"{base}_thumb.jpg"
-                                params = [
-                                    int(cv2.IMWRITE_JPEG_QUALITY),
-                                    int(state.settings.jpeg_quality or 80),
-                                ]
-                                # Save configured outputs (thumbs-only by default)
-                                if state.settings.store_full_frames:
-                                    try:
-                                        cv2.imwrite(str(full_path), frame, params)
-                                    except Exception:
-                                        pass
-                                if (
-                                    "crop" in locals()
-                                    and crop is not None
-                                    and crop.size > 0
-                                ):
-                                    if state.settings.store_crops:
+                                    delta_bits = _hamming(prev_sig, sig)
+                                    if stable and delta_bits >= min_bits:
+                                        # low-detail rejection
                                         try:
-                                            cv2.imwrite(str(crop_path), crop, params)
+                                            small2 = cv2.resize(
+                                                gray,
+                                                (64, 36),
+                                                interpolation=cv2.INTER_AREA,
+                                            )
+                                            mean = float(np.mean(small2))
+                                            std = float(np.std(small2))
+                                            if (mean < 6.0 or mean > 245.0) or (
+                                                std < 6.0
+                                            ):
+                                                raise RuntimeError("lowvar")
                                         except Exception:
                                             pass
-                                    if state.settings.store_thumbs:
                                         try:
-                                            h_c, w_c = crop.shape[:2]
-                                            if w_c > 0 and h_c > 0:
-                                                new_w = 240
-                                                new_h = max(1, int(h_c * (new_w / w_c)))
-                                                thumb = cv2.resize(
-                                                    crop,
-                                                    (new_w, new_h),
-                                                    interpolation=cv2.INTER_AREA,
-                                                )
-                                                cv2.imwrite(
-                                                    str(thumb_path), thumb, params
-                                                )
+                                            ts_ms = int(now * 1000)
+                                            base_name = f"evt_{ts_ms}_{s.id}"
+                                            full_path = (
+                                                state.frames_dir
+                                                / f"{base_name}_full.jpg"
+                                            )
+                                            crop_path = (
+                                                state.frames_dir
+                                                / f"{base_name}_crop.jpg"
+                                            )
+                                            thumb_path = (
+                                                state.frames_dir
+                                                / f"{base_name}_thumb.jpg"
+                                            )
+                                            params = [
+                                                int(cv2.IMWRITE_JPEG_QUALITY),
+                                                int(state.settings.jpeg_quality or 80),
+                                            ]
+                                            if state.settings.store_full_frames:
+                                                try:
+                                                    cv2.imwrite(
+                                                        str(full_path), frame, params
+                                                    )
+                                                except Exception:
+                                                    pass
+                                            if state.settings.store_crops:
+                                                try:
+                                                    cv2.imwrite(
+                                                        str(crop_path), crop, params
+                                                    )
+                                                except Exception:
+                                                    pass
+                                            if state.settings.store_thumbs:
+                                                try:
+                                                    h_c, w_c = crop.shape[:2]
+                                                    if w_c > 0 and h_c > 0:
+                                                        new_w = 240
+                                                        new_h = max(
+                                                            1, int(h_c * (new_w / w_c))
+                                                        )
+                                                        thumb = cv2.resize(
+                                                            crop,
+                                                            (new_w, new_h),
+                                                            interpolation=cv2.INTER_AREA,
+                                                        )
+                                                        cv2.imwrite(
+                                                            str(thumb_path),
+                                                            thumb,
+                                                            params,
+                                                        )
+                                                except Exception:
+                                                    pass
+                                            meta = {
+                                                "spot_id": s.id,
+                                                "prev_sig": prev_sig,
+                                                "new_sig": sig,
+                                                "delta_bits": delta_bits,
+                                            }
+                                            if (
+                                                state.settings.store_full_frames
+                                                and full_path.exists()
+                                            ):
+                                                meta["image_full"] = full_path.name
+                                            if (
+                                                state.settings.store_crops
+                                                and crop_path.exists()
+                                            ):
+                                                meta["image_crop"] = crop_path.name
+                                            if (
+                                                state.settings.store_thumbs
+                                                and thumb_path.exists()
+                                            ):
+                                                meta["image_thumb"] = thumb_path.name
+                                            state.events.add("spot_change", meta)
                                         except Exception:
                                             pass
-                                meta = {
-                                    "spot_id": s.id,
-                                    "prev_sig": prev_sig,
-                                    "new_sig": sig,
-                                    "delta_bits": _hamming(prev_sig, sig),
-                                    "duration_prev": duration_prev,
-                                }
-                                # Only include paths that actually exist and were configured
-                                if (
-                                    state.settings.store_full_frames
-                                    and full_path.exists()
-                                ):
-                                    meta["image_full"] = full_path.name
-                                if state.settings.store_crops and crop_path.exists():
-                                    meta["image_crop"] = crop_path.name
-                                if state.settings.store_thumbs and thumb_path.exists():
-                                    meta["image_thumb"] = thumb_path.name
-                                state.events.add("spot_change", meta)
-                                try:
-                                    logging.getLogger("uvicorn.error").info(
-                                        f"spot={s.id} status=accept delta={delta_bits} duration_prev={duration_prev:.1f}s"
-                                    )
-                                except Exception:
-                                    pass
-                            except Exception:
-                                pass
-                            state.spot_tracker[s.id] = {"sig": sig, "since": now}
-                            rec = state.spot_tracker[s.id]
-                        elif stable and delta_bits < min_bits:
-                            try:
-                                logging.getLogger("uvicorn.error").debug(
-                                    f"spot={s.id} status=reject delta={delta_bits} min_bits={min_bits}"
-                                )
-                            except Exception:
-                                pass
+                                        state.spot_tracker[s.id] = {
+                                            "sig": sig,
+                                            "since": now,
+                                        }
+                                        rec = state.spot_tracker[s.id]
             since = rec.get("since") if rec else None
             duration = (now - float(since)) if since else None
             stats.append(
@@ -498,6 +905,68 @@ def create_app() -> FastAPI:
             pass
         return {"ok": True, "deleted": int(deleted)}
 
+    # Spot-specific bulk clear (place before parameterized routes)
+    @app.get("/api/events/clear_spot", response_class=JSONResponse)
+    async def clear_spot_events_get(spot_id: str):
+        sid = (spot_id or "").strip()
+        if not sid:
+            raise HTTPException(400, "spot_id required")
+        return await _clear_spot_impl(sid)
+
+    @app.post("/api/events/clear_spot", response_class=JSONResponse)
+    async def clear_spot_events(payload: dict):
+        spot_id = str(payload.get("spot_id") or "").strip()
+        if not spot_id:
+            raise HTTPException(400, "spot_id required")
+        return await _clear_spot_impl(spot_id)
+
+    async def _clear_spot_impl(spot_id: str):
+        deleted = 0
+        files_deleted = 0
+        # Delete in batches to avoid loading everything at once
+        while True:
+            batch = state.events.events_with_spot(spot_id, limit=1000)
+            if not batch:
+                break
+            for e in batch:
+                # remove images
+                try:
+                    meta = e.get("meta") or {}
+                    for k in ("image_full", "image_crop", "image_thumb"):
+                        name = meta.get(k)
+                        if name:
+                            p = state.frames_dir / str(name)
+                            if p.exists():
+                                try:
+                                    p.unlink()
+                                    files_deleted += 1
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+                if state.events.delete(int(e["id"])):
+                    deleted += 1
+            # If we got fewer than limit, we're done
+            if len(batch) < 1000:
+                break
+        # Best-effort orphan cleanup not strictly necessary, but cheap for consistency
+        try:
+            ref = state.events.referenced_images()
+            if state.frames_dir.exists():
+                for p in state.frames_dir.glob("*.jpg"):
+                    if p.name not in ref:
+                        try:
+                            p.unlink()
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        return {
+            "ok": True,
+            "deleted": int(deleted),
+            "files_deleted": int(files_deleted),
+        }
+
     # Generic events API for read/edit/delete
     @app.get("/api/events", response_class=JSONResponse)
     async def list_events(limit: int = 100):
@@ -551,28 +1020,7 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "Event not found")
         return {"ok": True}
 
-    @app.post("/api/events/clear_all", response_class=JSONResponse)
-    async def clear_events():
-        # Remove all referenced images first, then clear DB
-        try:
-            ref = state.events.referenced_images()
-            for name in list(ref):
-                p = state.frames_dir / str(name)
-                if p.exists():
-                    try:
-                        p.unlink()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        deleted = state.events.clear()
-        # Also reset compare baseline so helper endpoints ignore older cache
-        try:
-            state.compare_baseline_ts = time.time()
-        except Exception:
-            pass
-        return {"ok": True, "deleted": int(deleted)}
-
+    # Duplicate clear_all route removed; handled by clear_events_api above.
 
     @app.get("/api/event_explain", response_class=JSONResponse)
     async def event_explain(id: int):
@@ -586,12 +1034,31 @@ def create_app() -> FastAPI:
             delta_bits = int(delta_bits) if delta_bits is not None else None
         except Exception:
             delta_bits = None
+        # Determine thresholds using category defaults, then apply per-spot overrides
         min_bits = int(state.settings.phash_min_bits or 0)
         stable_ms = int(state.settings.phash_stable_ms or 0)
         if spot_id:
             z = load_zones(state.zones_path)
             sp = next((s for s in z.spots if s.id == spot_id), None)
             if sp:
+                try:
+                    cat = (getattr(sp, "category", None) or "").strip().lower()
+                    if cat == "gate":
+                        stable_ms = int(
+                            state.settings.category_gate_stable_ms or stable_ms
+                        )
+                        min_bits = int(
+                            state.settings.category_gate_phash_min_bits or min_bits
+                        )
+                    elif cat == "parking":
+                        stable_ms = int(
+                            state.settings.category_parking_stable_ms or stable_ms
+                        )
+                        min_bits = int(
+                            state.settings.category_parking_phash_min_bits or min_bits
+                        )
+                except Exception:
+                    pass
                 try:
                     if getattr(sp, "min_bits", None) is not None:
                         min_bits = int(sp.min_bits)
@@ -602,7 +1069,7 @@ def create_app() -> FastAPI:
                         stable_ms = int(sp.stable_ms)
                 except Exception:
                     pass
-        meets = (delta_bits is not None and delta_bits >= min_bits)
+        meets = delta_bits is not None and delta_bits >= min_bits
         explanation = {
             "spot_id": spot_id,
             "delta_bits": delta_bits,
@@ -640,6 +1107,7 @@ def create_app() -> FastAPI:
             if len(by_spot[sid]) >= per_spot:
                 continue
         out = []
+        z = load_zones(state.zones_path)
         for sid, lst in by_spot.items():
             # lst is already newest-first from recent(); pick previous if available, else latest
             prev = lst[1] if len(lst) >= 2 else lst[0]
@@ -660,7 +1128,25 @@ def create_app() -> FastAPI:
             if not significant:
                 try:
                     dbits = int(meta.get("delta_bits") or 0)
-                    significant = dbits >= int(state.settings.phash_min_bits or 0) + 2
+                    # Use category-specific min_bits when possible
+                    mb = int(state.settings.phash_min_bits or 0)
+                    try:
+                        sp = next((s for s in z.spots if s.id == sid), None)
+                        if sp:
+                            cat = (getattr(sp, "category", None) or "").strip().lower()
+                            if cat == "gate":
+                                mb = int(
+                                    state.settings.category_gate_phash_min_bits or mb
+                                )
+                            elif cat == "parking":
+                                mb = int(
+                                    state.settings.category_parking_phash_min_bits or mb
+                                )
+                            if getattr(sp, "min_bits", None) is not None:
+                                mb = int(sp.min_bits)
+                    except Exception:
+                        pass
+                    significant = dbits >= (mb + 2)
                 except Exception:
                     significant = False
             if not significant:
@@ -705,7 +1191,6 @@ def create_app() -> FastAPI:
 
     @app.get("/api/images/summary", response_class=JSONResponse)
     async def images_summary():
-        import os
 
         total_files = 0
         total_bytes = 0
@@ -798,7 +1283,11 @@ def create_app() -> FastAPI:
         frame, _ts = latest
         # Encode JPEG at a limited rate and cache it to reduce CPU
         try:
-            min_period = 1.0 / max(0.1, float(state.settings.frame_jpeg_fps or 0)) if state.settings.frame_jpeg_fps else 0.0
+            min_period = (
+                1.0 / max(0.1, float(state.settings.frame_jpeg_fps or 0))
+                if state.settings.frame_jpeg_fps
+                else 0.0
+            )
         except Exception:
             min_period = 0.0
         now = time.time()
@@ -828,7 +1317,9 @@ def create_app() -> FastAPI:
             raise
         state._last_jpg = jpg
         state._last_jpg_ts = now
-        return Response(content=jpg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+        return Response(
+            content=jpg, media_type="image/jpeg", headers={"Cache-Control": "no-store"}
+        )
 
     # Removed grid cell preview endpoint for a simpler calibration UX
     # gate endpoint removed
@@ -939,32 +1430,74 @@ def create_app() -> FastAPI:
         return {
             "RTSP_URL": settings.rtsp_url or "",
             "DATA_DIR": str(settings.data_dir),
+            "DETECTOR_METHOD": settings.detector_method,
             "PHASH_MIN_BITS": int(settings.phash_min_bits or 0),
             "PHASH_STABLE_MS": int(settings.phash_stable_ms or 0),
+            "ROI_DIFF_ALPHA": float(settings.roi_diff_alpha or 0.05),
+            "ROI_DIFF_THRESHOLD": float(settings.roi_diff_threshold or 0.02),
+            # category defaults
+            "CATEGORY_GATE_STABLE_MS": int(settings.category_gate_stable_ms or 0),
+            "CATEGORY_GATE_PHASH_MIN_BITS": int(
+                settings.category_gate_phash_min_bits or 0
+            ),
+            "CATEGORY_GATE_ROI_DIFF_THRESHOLD": float(
+                settings.category_gate_roi_diff_threshold or 0.0
+            ),
+            "CATEGORY_PARKING_STABLE_MS": int(settings.category_parking_stable_ms or 0),
+            "CATEGORY_PARKING_PHASH_MIN_BITS": int(
+                settings.category_parking_phash_min_bits or 0
+            ),
+            "CATEGORY_PARKING_ROI_DIFF_THRESHOLD": float(
+                settings.category_parking_roi_diff_threshold or 0.0
+            ),
         }
 
     @app.post("/api/config", response_class=JSONResponse)
     async def set_config(payload: dict):
         # Optional values; only set if provided
-        rtsp = payload.get("RTSP_URL")
-        phash_bits = payload.get("PHASH_MIN_BITS")
-        phash_ms = payload.get("PHASH_STABLE_MS")
-        # Update in-memory settings for this process
-        if rtsp is not None:
-            rtsp_str = str(rtsp).strip()
+        def _opt_set_int(key, attr):
+            if key in payload and payload.get(key) is not None:
+                try:
+                    setattr(settings, attr, int(payload.get(key)))
+                except Exception:
+                    raise HTTPException(400, f"{key} must be an integer")
+
+        def _opt_set_float(key, attr):
+            if key in payload and payload.get(key) is not None:
+                try:
+                    setattr(settings, attr, float(payload.get(key)))
+                except Exception:
+                    raise HTTPException(400, f"{key} must be a number")
+
+        if payload.get("RTSP_URL") is not None:
+            rtsp_str = str(payload.get("RTSP_URL")).strip()
             if not rtsp_str:
                 raise HTTPException(400, "RTSP_URL required")
             settings.rtsp_url = rtsp_str
-        if phash_bits is not None:
-            try:
-                settings.phash_min_bits = int(phash_bits)
-            except Exception:
-                raise HTTPException(400, "PHASH_MIN_BITS must be an integer")
-        if phash_ms is not None:
-            try:
-                settings.phash_stable_ms = int(phash_ms)
-            except Exception:
-                raise HTTPException(400, "PHASH_STABLE_MS must be an integer")
+        if payload.get("DETECTOR_METHOD") is not None:
+            dm = str(payload.get("DETECTOR_METHOD")).strip().lower()
+            if dm not in {"phash", "roi_diff"}:
+                raise HTTPException(
+                    400, "DETECTOR_METHOD must be 'phash' or 'roi_diff'"
+                )
+            settings.detector_method = dm
+        _opt_set_int("PHASH_MIN_BITS", "phash_min_bits")
+        _opt_set_int("PHASH_STABLE_MS", "phash_stable_ms")
+        _opt_set_float("ROI_DIFF_ALPHA", "roi_diff_alpha")
+        _opt_set_float("ROI_DIFF_THRESHOLD", "roi_diff_threshold")
+        # Category defaults
+        _opt_set_int("CATEGORY_GATE_STABLE_MS", "category_gate_stable_ms")
+        _opt_set_int("CATEGORY_GATE_PHASH_MIN_BITS", "category_gate_phash_min_bits")
+        _opt_set_float(
+            "CATEGORY_GATE_ROI_DIFF_THRESHOLD", "category_gate_roi_diff_threshold"
+        )
+        _opt_set_int("CATEGORY_PARKING_STABLE_MS", "category_parking_stable_ms")
+        _opt_set_int(
+            "CATEGORY_PARKING_PHASH_MIN_BITS", "category_parking_phash_min_bits"
+        )
+        _opt_set_float(
+            "CATEGORY_PARKING_ROI_DIFF_THRESHOLD", "category_parking_roi_diff_threshold"
+        )
         # Persist to project .env
         try:
             project_root = Path(__file__).resolve().parents[1]
@@ -975,8 +1508,29 @@ def create_app() -> FastAPI:
                 lines = env_path.read_text(encoding="utf-8").splitlines()
             kv = {
                 "RTSP_URL": settings.rtsp_url or "",
+                "DETECTOR_METHOD": settings.detector_method,
                 "PHASH_MIN_BITS": str(int(settings.phash_min_bits or 0)),
                 "PHASH_STABLE_MS": str(int(settings.phash_stable_ms or 0)),
+                "ROI_DIFF_ALPHA": str(float(settings.roi_diff_alpha or 0.05)),
+                "ROI_DIFF_THRESHOLD": str(float(settings.roi_diff_threshold or 0.02)),
+                "CATEGORY_GATE_STABLE_MS": str(
+                    int(settings.category_gate_stable_ms or 0)
+                ),
+                "CATEGORY_GATE_PHASH_MIN_BITS": str(
+                    int(settings.category_gate_phash_min_bits or 0)
+                ),
+                "CATEGORY_GATE_ROI_DIFF_THRESHOLD": str(
+                    float(settings.category_gate_roi_diff_threshold or 0.0)
+                ),
+                "CATEGORY_PARKING_STABLE_MS": str(
+                    int(settings.category_parking_stable_ms or 0)
+                ),
+                "CATEGORY_PARKING_PHASH_MIN_BITS": str(
+                    int(settings.category_parking_phash_min_bits or 0)
+                ),
+                "CATEGORY_PARKING_ROI_DIFF_THRESHOLD": str(
+                    float(settings.category_parking_roi_diff_threshold or 0.0)
+                ),
             }
             keys = set(kv.keys())
             out_lines = []
@@ -993,12 +1547,7 @@ def create_app() -> FastAPI:
             env_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
         except Exception as e:
             raise HTTPException(500, f"Failed to write .env: {e}")
-        return {
-            "ok": True,
-            "RTSP_URL": settings.rtsp_url or "",
-            "PHASH_MIN_BITS": int(settings.phash_min_bits or 0),
-            "PHASH_STABLE_MS": int(settings.phash_stable_ms or 0),
-        }
+        return get_config()
 
     # Manual retention trigger
     @app.post("/api/retention/apply", response_class=JSONResponse)
@@ -1081,113 +1630,10 @@ def load_zones_from_payload(payload: dict):
                 polygon=[tuple(p) for p in s.get("polygon", [])],
                 min_bits=s.get("min_bits"),
                 stable_ms=s.get("stable_ms"),
+                category=s.get("category"),
             )
         )
     return Zones(gate=gate_poly, spots=spots)
-
-    # Analysis tasks/result endpoints
-    @app.get("/api/analysis/tasks", response_class=JSONResponse)
-    async def analysis_tasks(limit: int = 5):
-        import json
-
-        tasks_dir = state.data_dir / "analysis" / "tasks"
-        items = []
-        if tasks_dir.exists():
-            files = sorted(
-                tasks_dir.glob("*.json"), key=lambda p: p.name, reverse=True
-            )[:limit]
-            for p in files:
-                try:
-                    with p.open("r", encoding="utf-8") as f:
-                        t = json.load(f)
-                    t["image_url"] = f"/data/{t.get('image','')}"
-                    items.append(t)
-                except Exception:
-                    continue
-        return {"tasks": items}
-
-    @app.post("/api/analysis/result", response_class=JSONResponse)
-    async def analysis_result(payload: dict):
-        import json
-
-        tid = str(payload.get("id", ""))
-        if not tid:
-            raise HTTPException(400, "Missing id")
-        out_dir = state.data_dir / "analysis" / "results"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        with (out_dir / f"{tid}.json").open("w", encoding="utf-8") as f:
-            json.dump(payload, f)
-        try:
-            state.events.add("analysis", {"task": tid})
-        except Exception:
-            pass
-        return {"ok": True}
-
-    @app.get("/api/analysis/latest", response_class=JSONResponse)
-    async def analysis_latest():
-        import json
-
-        res_dir = state.data_dir / "analysis" / "results"
-        if not res_dir.exists():
-            return {"result": None}
-        files = sorted(res_dir.glob("*.json"), key=lambda p: p.name, reverse=True)
-        if not files:
-            return {"result": None}
-        with files[0].open("r", encoding="utf-8") as f:
-            return {"result": json.load(f)}
-
-    # Simple config helpers to get/set RTSP_URL in .env
-    @app.get("/api/config", response_class=JSONResponse)
-    async def get_config():
-        return {"RTSP_URL": settings.rtsp_url or "", "DATA_DIR": str(settings.data_dir)}
-
-    @app.post("/api/config", response_class=JSONResponse)
-    async def set_config(payload: dict):
-        rtsp = str(payload.get("RTSP_URL", "")).strip()
-        if not rtsp:
-            raise HTTPException(400, "RTSP_URL required")
-        # Update in-memory settings for this process
-        settings.rtsp_url = rtsp
-        # Persist to project .env
-        try:
-            project_root = Path(__file__).resolve().parents[1]
-            env_path = project_root / ".env"
-            # read existing (if any), replace line or append
-            lines = []
-            if env_path.exists():
-                lines = env_path.read_text(encoding="utf-8").splitlines()
-            updated = False
-            out_lines = []
-            for ln in lines:
-                if ln.strip().startswith("RTSP_URL="):
-                    out_lines.append(f"RTSP_URL={rtsp}")
-                    updated = True
-                else:
-                    out_lines.append(ln)
-            if not updated:
-                out_lines.append(f"RTSP_URL={rtsp}")
-            env_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
-        except Exception as e:
-            raise HTTPException(500, f"Failed to write .env: {e}")
-        return {"ok": True, "RTSP_URL": rtsp}
-
-    @app.get("/api/spot_history", response_class=JSONResponse)
-    async def spot_history(spot_id: str, limit: int = 8):
-        evs = state.events.spot_events(spot_id, limit)
-        out = []
-        for e in evs:
-            meta = e.get("meta") or {}
-            out.append(
-                {
-                    "id": e["id"],
-                    "ts": e["ts"],
-                    "spot_id": spot_id,
-                    "thumb": f"/api/event_image?id={e['id']}&kind=thumb",
-                    "full": f"/api/event_image?id={e['id']}&kind=full",
-                    "crop": f"/api/event_image?id={e['id']}&kind=crop",
-                }
-            )
-        return {"items": out}
 
 
 app = create_app()

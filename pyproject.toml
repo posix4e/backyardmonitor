@@ -25,3 +25,34 @@ bm = [
   "static/*",
   "static/**/*",
 ]
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+include = "\\.pyi?$"
+exclude = """
+(
+  /(
+      \\.venv
+    | data
+    | backyardmonitor\\.egg-info
+    | build
+    | dist
+    | \\.git
+  )/
+)
+"""
+
+[dependency-groups]
+dev = [
+  "black>=24.8",
+  "pyflakes>=3.2",
+  "djlint>=1.34",
+  "jsbeautifier>=1.15",
+]
+
+[tool.djlint]
+profile = "html"
+indent = 2
+max_line_length = 88
+include = ["bm/static/**/*.html", "bm/static/*.html"]

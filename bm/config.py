@@ -30,6 +30,31 @@ class Settings:
     retain_days: int = 3
     max_events: int = 5000
     max_storage_gb: int = 10
+    # Detection method and ROI-diff parameters
+    detector_method: str = "phash"  # one of: phash, roi_diff
+    roi_diff_alpha: float = 0.05
+    roi_diff_threshold: float = 0.02
+    roi_diff_min_pixels: int = 600
+    roi_diff_cooldown_ms: int = 0
+    # Category defaults (semantic, independent of ROI/gate geometry)
+    category_gate_stable_ms: int = 400
+    category_gate_phash_min_bits: int = 10
+    category_gate_roi_diff_threshold: float = 0.035
+    category_gate_min_pixels: int = 800
+    category_gate_cooldown_ms: int = 3000
+    category_gate_flow_mag_min: float = 0.5
+    category_parking_stable_ms: int = 1200
+    category_parking_phash_min_bits: int = 14
+    category_parking_roi_diff_threshold: float = 0.02
+    category_parking_min_pixels: int = 600
+    category_parking_cooldown_ms: int = 45000
+    # Road/lane category
+    category_road_stable_ms: int = 800
+    category_road_phash_min_bits: int = 16
+    category_road_roi_diff_threshold: float = 0.08
+    category_road_min_pixels: int = 1200
+    category_road_cooldown_ms: int = 5000
+    category_road_flow_mag_min: float = 1.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -106,17 +131,79 @@ class Settings:
             frame_jpeg_fps = 2.0
         # Auto-resync knobs
         try:
-            capture_idle_resync_ms = max(0, int(os.getenv("CAPTURE_IDLE_RESYNC_MS", "2500")))
+            capture_idle_resync_ms = max(
+                0, int(os.getenv("CAPTURE_IDLE_RESYNC_MS", "2500"))
+            )
         except Exception:
             capture_idle_resync_ms = 2500
         try:
-            capture_fail_resync_count = max(1, int(os.getenv("CAPTURE_FAIL_RESYNC_COUNT", "10")))
+            capture_fail_resync_count = max(
+                1, int(os.getenv("CAPTURE_FAIL_RESYNC_COUNT", "10"))
+            )
         except Exception:
             capture_fail_resync_count = 10
         try:
-            capture_reopen_delay_ms = max(0, int(os.getenv("CAPTURE_REOPEN_DELAY_MS", "300")))
+            capture_reopen_delay_ms = max(
+                0, int(os.getenv("CAPTURE_REOPEN_DELAY_MS", "300"))
+            )
         except Exception:
             capture_reopen_delay_ms = 300
+        # Detection method
+        detector_method = os.getenv("DETECTOR_METHOD", "phash").strip().lower()
+        try:
+            roi_diff_alpha = float(os.getenv("ROI_DIFF_ALPHA", "0.05"))
+        except Exception:
+            roi_diff_alpha = 0.05
+        try:
+            roi_diff_threshold = float(os.getenv("ROI_DIFF_THRESHOLD", "0.02"))
+        except Exception:
+            roi_diff_threshold = 0.02
+        try:
+            roi_diff_min_pixels = int(os.getenv("ROI_DIFF_MIN_PIXELS", "600"))
+        except Exception:
+            roi_diff_min_pixels = 600
+        try:
+            roi_diff_cooldown_ms = int(os.getenv("ROI_DIFF_COOLDOWN_MS", "0"))
+        except Exception:
+            roi_diff_cooldown_ms = 0
+
+        # Category defaults (optional)
+        def _int(env, default):
+            try:
+                return int(os.getenv(env, str(default)))
+            except Exception:
+                return default
+
+        def _float(env, default):
+            try:
+                return float(os.getenv(env, str(default)))
+            except Exception:
+                return default
+
+        category_gate_stable_ms = _int("CATEGORY_GATE_STABLE_MS", 400)
+        category_gate_phash_min_bits = _int("CATEGORY_GATE_PHASH_MIN_BITS", 10)
+        category_gate_roi_diff_threshold = _float(
+            "CATEGORY_GATE_ROI_DIFF_THRESHOLD", 0.035
+        )
+        category_gate_min_pixels = _int("CATEGORY_GATE_MIN_PIXELS", 800)
+        category_gate_cooldown_ms = _int("CATEGORY_GATE_COOLDOWN_MS", 3000)
+        category_gate_flow_mag_min = _float("CATEGORY_GATE_FLOW_MAG_MIN", 0.5)
+        category_parking_stable_ms = _int("CATEGORY_PARKING_STABLE_MS", 1200)
+        category_parking_phash_min_bits = _int("CATEGORY_PARKING_PHASH_MIN_BITS", 14)
+        category_parking_roi_diff_threshold = _float(
+            "CATEGORY_PARKING_ROI_DIFF_THRESHOLD", 0.02
+        )
+        category_parking_min_pixels = _int("CATEGORY_PARKING_MIN_PIXELS", 600)
+        category_parking_cooldown_ms = _int("CATEGORY_PARKING_COOLDOWN_MS", 45000)
+        # Road
+        category_road_stable_ms = _int("CATEGORY_ROAD_STABLE_MS", 800)
+        category_road_phash_min_bits = _int("CATEGORY_ROAD_PHASH_MIN_BITS", 16)
+        category_road_roi_diff_threshold = _float(
+            "CATEGORY_ROAD_ROI_DIFF_THRESHOLD", 0.08
+        )
+        category_road_min_pixels = _int("CATEGORY_ROAD_MIN_PIXELS", 1200)
+        category_road_cooldown_ms = _int("CATEGORY_ROAD_COOLDOWN_MS", 5000)
+        category_road_flow_mag_min = _float("CATEGORY_ROAD_FLOW_MAG_MIN", 1.0)
 
         return cls(
             rtsp_url=rtsp_url,
@@ -138,4 +225,26 @@ class Settings:
             capture_idle_resync_ms=capture_idle_resync_ms,
             capture_fail_resync_count=capture_fail_resync_count,
             capture_reopen_delay_ms=capture_reopen_delay_ms,
+            detector_method=detector_method,
+            roi_diff_alpha=roi_diff_alpha,
+            roi_diff_threshold=roi_diff_threshold,
+            roi_diff_min_pixels=roi_diff_min_pixels,
+            roi_diff_cooldown_ms=roi_diff_cooldown_ms,
+            category_gate_stable_ms=category_gate_stable_ms,
+            category_gate_phash_min_bits=category_gate_phash_min_bits,
+            category_gate_roi_diff_threshold=category_gate_roi_diff_threshold,
+            category_gate_min_pixels=category_gate_min_pixels,
+            category_gate_cooldown_ms=category_gate_cooldown_ms,
+            category_gate_flow_mag_min=category_gate_flow_mag_min,
+            category_parking_stable_ms=category_parking_stable_ms,
+            category_parking_phash_min_bits=category_parking_phash_min_bits,
+            category_parking_roi_diff_threshold=category_parking_roi_diff_threshold,
+            category_parking_min_pixels=category_parking_min_pixels,
+            category_parking_cooldown_ms=category_parking_cooldown_ms,
+            category_road_stable_ms=category_road_stable_ms,
+            category_road_phash_min_bits=category_road_phash_min_bits,
+            category_road_roi_diff_threshold=category_road_roi_diff_threshold,
+            category_road_min_pixels=category_road_min_pixels,
+            category_road_cooldown_ms=category_road_cooldown_ms,
+            category_road_flow_mag_min=category_road_flow_mag_min,
         )

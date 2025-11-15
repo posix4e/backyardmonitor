@@ -63,12 +63,30 @@ class EventStore:
 
     def spot_events(self, spot_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         # Simple LIKE on JSON blob for portability (avoid requiring SQLite JSON1)
-        like = f'%"spot_id":"{spot_id}"%'
+        # Be tolerant of whitespace after colon in JSON dumps
+        p1 = f'%"spot_id":"{spot_id}"%'
+        p2 = f'%"spot_id": "{spot_id}"%'
         with sqlite3.connect(self.db_path) as con:
             con.row_factory = sqlite3.Row
             rows = con.execute(
-                "SELECT id, ts, kind, meta FROM events WHERE kind = 'spot_change' AND meta LIKE ? ORDER BY ts DESC LIMIT ?",
-                (like, int(limit)),
+                "SELECT id, ts, kind, meta FROM events WHERE kind = 'spot_change' AND (meta LIKE ? OR meta LIKE ?) ORDER BY ts DESC LIMIT ?",
+                (p1, p2, int(limit)),
+            ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            meta = json.loads(r["meta"]) if r["meta"] else {}
+            out.append({"id": r["id"], "ts": r["ts"], "kind": r["kind"], "meta": meta})
+        return out
+
+    def events_with_spot(self, spot_id: str, limit: int = 1000) -> List[Dict[str, Any]]:
+        """Return events of any kind whose meta contains spot_id."""
+        p1 = f'%"spot_id":"{spot_id}"%'
+        p2 = f'%"spot_id": "{spot_id}"%'
+        with sqlite3.connect(self.db_path) as con:
+            con.row_factory = sqlite3.Row
+            rows = con.execute(
+                "SELECT id, ts, kind, meta FROM events WHERE (meta LIKE ? OR meta LIKE ?) ORDER BY ts DESC LIMIT ?",
+                (p1, p2, int(limit)),
             ).fetchall()
         out: List[Dict[str, Any]] = []
         for r in rows:
@@ -140,7 +158,9 @@ class EventStore:
     def all(self) -> List[Dict[str, Any]]:
         with sqlite3.connect(self.db_path) as con:
             con.row_factory = sqlite3.Row
-            rows = con.execute("SELECT id, ts, kind, meta FROM events ORDER BY id ASC").fetchall()
+            rows = con.execute(
+                "SELECT id, ts, kind, meta FROM events ORDER BY id ASC"
+            ).fetchall()
         out: List[Dict[str, Any]] = []
         for r in rows:
             meta = json.loads(r["meta"]) if r["meta"] else {}

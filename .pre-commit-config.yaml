@@ -1,0 +1,17 @@
+# Enable Black for consistent Python formatting
+repos:
+  - repo: https://github.com/psf/black
+    rev: 24.10.0
+    hooks:
+      - id: black
+        name: black (python formatter)
+        language_version: python3
+        args: ["--quiet"]
+    # Pre-commit only scans version-controlled files; exclude runtime dirs anyway
+exclude: |
+  ^(
+    data/|
+    \.venv/|
+    backyardmonitor\.egg-info/
+  )
+
