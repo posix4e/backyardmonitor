@@ -57,8 +57,8 @@ class Settings:
     category_road_flow_mag_min: float = 1.0
     # LLM analysis
     llm_enabled: bool = False
-    llm_provider: str = "openai"
-    llm_model_fast: str = "gpt-4o-mini"
+    llm_provider: str = "openrouter"
+    llm_model_fast: str = "google/gemini-2.5-flash"
     llm_timeout_sec: int = 20
 
     @classmethod
@@ -216,8 +216,8 @@ class Settings:
             "yes",
             "on",
         }
-        llm_provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
-        llm_model_fast = os.getenv("LLM_MODEL_FAST", "gpt-4o-mini").strip()
+        llm_provider = os.getenv("LLM_PROVIDER", "openrouter").strip().lower()
+        llm_model_fast = os.getenv("LLM_MODEL_FAST", "google/gemini-2.5-flash").strip()
         try:
             llm_timeout_sec = int(os.getenv("LLM_TIMEOUT_SEC", "20"))
         except Exception:

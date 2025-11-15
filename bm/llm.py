@@ -5,6 +5,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from queue import Queue, Empty
 from typing import Optional
@@ -181,6 +182,46 @@ class LLMWorker:
                     significant = ("true" in txt.lower()) and (
                         "false" not in txt.lower()
                     )
+                    reason = txt[:180]
+            elif provider == "openrouter":
+                import requests
+                api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
+                if not api_key:
+                    raise RuntimeError("openrouter_api_key_missing")
+                url = "https://openrouter.ai/api/v1/chat/completions"
+                content = [{"type": "text", "text": prompt}]
+                if prev_b64:
+                    content.append({"type": "image_url", "image_url": {"url": prev_b64}})
+                if img_b64:
+                    content.append({"type": "image_url", "image_url": {"url": img_b64}})
+                payload = {
+                    "model": model or "google/gemini-2.5-flash",
+                    "messages": [
+                        {"role": "user", "content": content},
+                    ],
+                    "temperature": 0.2,
+                    "max_tokens": 80,
+                }
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                }
+                r = requests.post(url, json=payload, headers=headers, timeout=max(5, int(self.cfg.timeout_sec or 20)))
+                if r.status_code >= 400:
+                    raise RuntimeError(f"openrouter_http_{r.status_code}")
+                data = r.json()
+                msg = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                txt = (msg or "").strip()
+                try:
+                    if txt.startswith("```"):
+                        txt = txt.strip("` ")
+                        if txt.lower().startswith("json"):
+                            txt = txt[4:].strip()
+                    d = json.loads(txt)
+                    significant = bool(d.get("significant", False))
+                    reason = str(d.get("reason", "")).strip()
+                except Exception:
+                    significant = ("true" in txt.lower()) and ("false" not in txt.lower())
                     reason = txt[:180]
         except Exception as e:
             # Leave defaults; mark failure below

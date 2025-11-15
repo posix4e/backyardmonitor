@@ -17,6 +17,7 @@ function fmtTs(t) {
 async function load() {
   const id = q('event');
   if (!id) { alert('Missing ?event='); return; }
+  const statusEl = document.getElementById('run_status');
   const ev = await (await fetch(`/api/events/${encodeURIComponent(String(id))}`)).json();
   const meta = ev && ev.meta ? ev.meta : {};
   // Fill header
@@ -93,6 +94,41 @@ async function load() {
   }
   const anEl = document.getElementById('analysis');
   if (anEl) anEl.textContent = an.join('\n');
+
+  // Wire re-run button
+  const btn = document.getElementById('btn_rerun');
+  if (btn) {
+    btn.addEventListener('click', async () => {
+      try {
+        statusEl.textContent = 'Queuing analysis…';
+        const r = await fetch(`/api/llm/queue_event?id=${encodeURIComponent(String(id))}`, { method: 'POST' });
+        if (!r.ok) {
+          statusEl.textContent = 'Queue failed';
+          return;
+        }
+        // Poll until llm_status is done/error
+        const start = Date.now();
+        const timeoutMs = 20000;
+        async function poll() {
+          const ev2 = await (await fetch(`/api/events/${encodeURIComponent(String(id))}`)).json();
+          const m2 = ev2 && ev2.meta ? ev2.meta : {};
+          if (m2.llm_status && m2.llm_status !== 'started') {
+            statusEl.textContent = 'Completed';
+            location.reload();
+            return;
+          }
+          if (Date.now() - start > timeoutMs) {
+            statusEl.textContent = 'Timed out waiting for result';
+            return;
+          }
+          setTimeout(poll, 800);
+        }
+        setTimeout(poll, 800);
+      } catch (e) {
+        statusEl.textContent = 'Error';
+      }
+    });
+  }
 }
 
 load();

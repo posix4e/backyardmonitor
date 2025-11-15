@@ -9,6 +9,7 @@ dependencies = [
   "opencv-python-headless>=4.7",
   "numpy>=1.24",
   "openai>=1.0.0",
+  "requests>=2.32",
 ]
 
 [project.scripts]
