@@ -179,8 +179,8 @@ def create_app() -> FastAPI:
         method = (state.settings.detector_method or "phash").lower()
 
         def _category_params(category: str | None):
-            # Default unlabeled spots to 'parking' semantics
-            c = (category or "parking").strip().lower()
+            # Default unlabeled spots to 'spot' semantics (alias of previous 'parking')
+            c = (category or "spot").strip().lower()
             if c == "gate":
                 return {
                     "stable_ms": int(state.settings.category_gate_stable_ms or 0),
@@ -204,7 +204,7 @@ def create_app() -> FastAPI:
                         state.settings.category_gate_flow_mag_min or 0.0
                     ),
                 }
-            elif c == "parking":
+            elif c in ("spot", "parking"):
                 return {
                     "stable_ms": int(state.settings.category_parking_stable_ms or 0),
                     "phash_min_bits": int(
@@ -1072,7 +1072,7 @@ def create_app() -> FastAPI:
                         min_bits = int(
                             state.settings.category_gate_phash_min_bits or min_bits
                         )
-                    elif cat == "parking":
+                    elif cat in ("spot", "parking"):
                         stable_ms = int(
                             state.settings.category_parking_stable_ms or stable_ms
                         )
@@ -1160,7 +1160,7 @@ def create_app() -> FastAPI:
                                 mb = int(
                                     state.settings.category_gate_phash_min_bits or mb
                                 )
-                            elif cat == "parking":
+                            elif cat in ("spot", "parking"):
                                 mb = int(
                                     state.settings.category_parking_phash_min_bits or mb
                                 )
