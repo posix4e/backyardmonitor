@@ -15,6 +15,9 @@ class Settings:
     # Perception thresholds
     phash_min_bits: int = 14
     phash_stable_ms: int = 1200
+    # Performance
+    capture_max_fps: float = 5.0
+    frame_jpeg_fps: float = 2.0
     # Storage/retention
     store_full_frames: bool = False
     store_crops: bool = False
@@ -88,6 +91,15 @@ class Settings:
             "yes",
             "on",
         }
+        # Performance knobs
+        try:
+            capture_max_fps = float(os.getenv("CAPTURE_MAX_FPS", "5"))
+        except Exception:
+            capture_max_fps = 5.0
+        try:
+            frame_jpeg_fps = float(os.getenv("FRAME_JPEG_FPS", "2"))
+        except Exception:
+            frame_jpeg_fps = 2.0
 
         return cls(
             rtsp_url=rtsp_url,
@@ -104,4 +116,6 @@ class Settings:
             retain_days=retain_days,
             max_events=max_events,
             max_storage_gb=max_storage_gb,
+            capture_max_fps=capture_max_fps,
+            frame_jpeg_fps=frame_jpeg_fps,
         )

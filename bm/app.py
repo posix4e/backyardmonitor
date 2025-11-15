@@ -35,12 +35,17 @@ class AppState:
         self.spot_tracker: dict[str, dict[str, float | str]] = {}
         # Comparison filtering baseline (events older than this ts are ignored for prev/compare)
         self.compare_baseline_ts: float = 0.0
+        # Cached JPEG to avoid re-encoding every request
+        self._last_jpg: bytes | None = None
+        self._last_jpg_ts: float = 0.0
 
     def ensure_capture(self) -> None:
         if not self.settings.rtsp_url:
             return
         if self.capture is None:
-            self.capture = VideoCaptureWorker(self.settings.rtsp_url)
+            self.capture = VideoCaptureWorker(
+                self.settings.rtsp_url, max_fps=self.settings.capture_max_fps
+            )
         # start only if not running
         self.capture.start()
 
@@ -659,7 +664,23 @@ def create_app() -> FastAPI:
         if not latest:
             raise HTTPException(404, "No frame available")
         frame, _ts = latest
-        jpg = state.capture.encode_jpeg(frame)
+        # Encode JPEG at a limited rate and cache it to reduce CPU
+        try:
+            min_period = 1.0 / max(0.1, float(state.settings.frame_jpeg_fps or 0)) if state.settings.frame_jpeg_fps else 0.0
+        except Exception:
+            min_period = 0.0
+        now = time.time()
+        use_cache = False
+        if min_period > 0.0 and state._last_jpg is not None:
+            if (now - state._last_jpg_ts) < min_period:
+                use_cache = True
+        if use_cache and state._last_jpg is not None:
+            return Response(content=state._last_jpg, media_type="image/jpeg")
+        jpg = state.capture.encode_jpeg(
+            frame, quality=int(state.settings.jpeg_quality or 80)
+        )
+        state._last_jpg = jpg
+        state._last_jpg_ts = now
         return Response(content=jpg, media_type="image/jpeg")
 
     # Removed grid cell preview endpoint for a simpler calibration UX

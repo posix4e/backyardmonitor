@@ -22,8 +22,9 @@ class CaptureState:
 
 
 class VideoCaptureWorker:
-    def __init__(self, source: str):
+    def __init__(self, source: str, max_fps: float | None = None):
         self.source = source
+        self.max_fps = float(max_fps) if (max_fps is not None and max_fps > 0) else 0.0
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -55,13 +56,23 @@ class VideoCaptureWorker:
             time.sleep(1.0)
             cap = cv2.VideoCapture(self.source)
         self.state.running = cap.isOpened()
+        min_period = (1.0 / self.max_fps) if self.max_fps > 0 else 0.0
+        last_push = 0.0
         try:
             while not self._stop.is_set() and cap.isOpened():
+                # simple fps limiter to reduce CPU burn from decoding
+                if min_period > 0.0:
+                    now = time.time()
+                    dt = now - last_push
+                    if dt < min_period:
+                        time.sleep(min_period - dt)
+                
                 ok, frame = cap.read()
                 ts = time.time()
                 if not ok or frame is None:
                     time.sleep(0.05)
                     continue
+                last_push = ts
                 h, w = frame.shape[:2]
                 self.state.width, self.state.height = w, h
                 self.state.last_ts = ts
