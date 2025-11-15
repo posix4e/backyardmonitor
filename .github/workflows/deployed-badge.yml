@@ -1,0 +1,28 @@
+name: Deployed Badge
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "*/10 * * * *"
+
+jobs:
+  update-badge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Update badge from running deployment
+        env:
+          GIST_ID: ${{ secrets.DEPLOY_BADGE_GIST_ID }}
+          GITHUB_TOKEN: ${{ secrets.DEPLOY_BADGE_GIST_TOKEN }}
+          API_URL: https://monitor.newman.family/api/version
+          BADGE_LABEL: deployed
+          BADGE_COLOR: blue
+        run: |
+          python scripts/update_badge_gist.py
