@@ -885,9 +885,11 @@ function renderEventsList(items) {
         const hasSpot = !!(it && it.meta && it.meta.spot_id);
         const isSpotChange = String(it && it.kind || '').toLowerCase() === 'spot_change';
         const showWhy = hasSpot && isSpotChange;
+        const sig = !!(it && it.meta && it.meta.significant);
+        const sigBadge = sig && isSpotChange ? `<span class=\"badge\" style=\"background:#0b6; color:#fff; padding:2px 6px; border-radius:10px; font-size:11px;\">Significant</span>` : '';
         return `<div style=\"display:flex; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid #f2f2f2;\">` +
             `<span style=\"width:56px;\">#${it.id}</span>` +
-            `<span style=\"flex:1;\">${safe(it.kind)}</span>` +
+            `<span style=\"flex:1;\">${safe(it.kind)}</span>` + sigBadge +
             `<span class=\"muted\" style=\"flex:1;\">${safe(ts)}</span>` +
             (showWhy ? `<button data-eid=\"${it.id}\" class=\"ev_why\">Why?</button>` : '') +
             `<button data-eid=\"${it.id}\" class=\"ev_edit\">Edit</button>` +
@@ -1284,10 +1286,12 @@ async function loadThumbnails() {
         const grid = document.getElementById('thumb_grid');
         const fmt = (t) => new Date((t || 0) * 1000).toLocaleString();
         grid.innerHTML = (j.items || []).map((it) => {
+            const badge = it.significant ? `<span class="badge" style="position:absolute; left:6px; top:6px; background:#0b6; color:#fff; padding:2px 6px; border-radius:10px; font-size:11px;">Significant</span>` : '';
             return `<div style="position:relative; display:inline-block;">` +
                 `<a href="${it.full}" target="_blank" title="#${it.event_id} - ${fmt(it.ts)}">` +
                 `<img src="${it.thumb}" style="max-width:140px; border-radius:6px; border:1px solid #eee;"/>` +
                 `</a>` +
+                badge +
                 `<button class="thumb_delete" data-eid="${it.event_id}" title="Delete" style="position:absolute; right:4px; top:4px; background:#fff; border:1px solid #ccc; border-radius:10px; width:22px; height:22px; line-height:1; color:#b00000; cursor:pointer;">×</button>` +
                 `</div>`;
         }).join('');

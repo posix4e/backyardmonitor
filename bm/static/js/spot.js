@@ -219,6 +219,7 @@ function renderRow(spotId, list, idx, highlightId) {
     const curFull = it.full || thumb;
     const prevThumb = prev ? (prev.thumb || prev.crop || prev.full) : null;
     const delta = (it.delta_bits != null) ? `<span class="badge">Δ ${it.delta_bits}</span>` : '';
+    const sigBadge = it.significant ? `<span class="badge" style="background:#0b6; color:#fff; padding:2px 6px; border-radius:10px; font-size:11px;">Significant</span>` : '';
     const idAttr = `id="ev_${String(it.id)}"`;
     const cmp = prev && prevThumb ? `
           <div class="cmp" style="display:none;">
@@ -232,7 +233,7 @@ function renderRow(spotId, list, idx, highlightId) {
           <div class="rowitem" ${idAttr}>
             <a href="${curFull}" target="_blank" title="#${it.id}"><img src="${thumb}"/></a>
             <div class="meta">
-              <div><span class="badge">#${it.id}</span> ${delta} <span class="muted">${fmtTs(it.ts)}</span></div>
+              <div><span class="badge">#${it.id}</span> ${delta} ${sigBadge} <span class="muted">${fmtTs(it.ts)}</span></div>
               <div class="actions">
                 <a href="/static/spot.html?spot=${encodeURIComponent(spotId)}&event=${encodeURIComponent(String(it.id))}">Link</a>
                 <a href="${curFull}" target="_blank">Full</a>

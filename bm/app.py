@@ -1269,6 +1269,7 @@ def create_app() -> FastAPI:
                     "ts": e["ts"],
                     "thumb": f"/api/event_image?id={e['id']}&kind=thumb",
                     "full": f"/api/event_image?id={e['id']}&kind=full",
+                    "significant": bool(meta.get("significant") or False),
                 }
             )
             if len(items) >= limit:
