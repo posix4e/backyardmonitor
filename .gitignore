@@ -1,7 +1,10 @@
 data/
+out/
 bm/data.o/
 .env
 .env.*
+out/
+*.pt
 __pycache__/
 *.py[cod]
 .pytest_cache/

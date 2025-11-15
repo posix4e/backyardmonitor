@@ -8,8 +8,12 @@
       .muted { color:#666; }
       label { display:block; margin-top:6px; }
       input[type=number] { width: 6em; }
-      .tooltip { position:absolute; background:#fff; border:1px solid #ccc; border-radius:8px; box-shadow:0 2px 12px rgba(0,0,0,0.12); padding:6px 8px; display:none; z-index:10; }
-      .tooltip button { margin-right:6px; }
+      /* Removed floating tooltip; use side panel instead */
+      .panel-section { margin-top:16px; }
+      .list { max-height:200px; overflow:auto; border:1px solid #eee; border-radius:6px; padding:4px; }
+      .list-item { padding:4px 6px; border-radius:4px; cursor:pointer; display:flex; gap:6px; align-items:center; }
+      .list-item:hover { background:#f5f7fa; }
+      .list-item.active { background:#e8f1ff; }
       .pulse-indicator { position:absolute; border-radius:6px; box-shadow:0 0 0 2px rgba(255,0,0,0.5), 0 0 18px rgba(255,0,0,0.35); animation:pulse 1s ease-out infinite; pointer-events:none; z-index:9; }
       @keyframes pulse { 0%{ box-shadow:0 0 0 2px rgba(255,0,0,0.6), 0 0 0 rgba(255,0,0,0.0);} 70%{ box-shadow:0 0 0 6px rgba(255,0,0,0.2), 0 0 18px rgba(255,0,0,0.4);} 100%{ box-shadow:0 0 0 2px rgba(255,0,0,0.6), 0 0 0 rgba(255,0,0,0.0);} }
       .change-button { position:absolute; right:6px; top:6px; cursor:pointer; }
@@ -23,6 +27,8 @@
       .compare-close { position:absolute; right:6px; top:6px; background:transparent; border:none; font-size:14px; cursor:pointer; }
       .delta-badge { position:absolute; left:6px; top:6px; background:#111; color:#fff; font-size:11px; padding:2px 6px; border-radius:10px; opacity:0.85; }
       #canvasWrap { position: relative; display: inline-block; }
+      /* Improve mobile interactions */
+      canvas { touch-action: none; -webkit-user-select: none; user-select: none; }
     </style>
   </head>
   <body>
@@ -30,14 +36,13 @@
     <div class="controls">
       <button id="btnStart" onclick="control('start')">Start</button>
       <button id="btnStop" onclick="control('stop')">Stop</button>
-      <span class="muted">Spots: click to add; click to select; arrows to nudge; Delete to remove.</span>
+      <span class="muted">Spots: click/tap to add or select; drag to move; arrows to nudge; Delete to remove; drag vertices to reshape; Shift+click edge to add a point; double‑click a spot (or list entry) for details.</span>
     </div>
     <div class="row" style="margin-top:12px;">
       <div class="card">
         <div><strong>Live Frame</strong></div>
         <div id="canvasWrap">
           <canvas id="canvas" width="640" height="360"></canvas>
-          <div id="spotToolbar" class="tooltip"></div>
         </div>
         <div class="muted" id="status"></div>
         <div style="margin-top:8px; display:flex; gap:8px; align-items:center; flex-wrap: wrap;">
@@ -52,6 +57,28 @@
           <div><strong>Data</strong></div>
         </div>
         <div id="panel_data">
+        <div class="panel-section">
+          <div style="font-weight:600; margin-bottom:4px;">Spots</div>
+          <div style="display:flex; gap:6px; align-items:center; margin-bottom:6px; flex-wrap:wrap;">
+            <input id="spot_search" type="text" placeholder="Search spots..." style="flex:1; min-width:200px;" oninput="renderSpotList()" />
+            <button onclick="compareSelected()" title="Compare selected (prev vs current)">★ Compare</button>
+          </div>
+          <div id="spot_list" class="list"></div>
+          <div id="spot_editor" style="margin-top:8px; display:none;">
+            <div style="margin-bottom:6px;">Edit Spot <span id="spot_edit_id" class="muted"></span></div>
+            <label for="spot_name">Name</label>
+            <input id="spot_name" type="text" style="width: 260px;" oninput="onSpotNameInput()"/>
+            <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:6px;">
+              <label>Min bits <input id="spot_min_bits" type="number" style="width:80px;"></label>
+              <label>Stable ms <input id="spot_stable_ms" type="number" style="width:100px;"></label>
+              <span id="spot_size" class="muted" style="font-size:12px;"></span>
+            </div>
+            <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;">
+              <button onclick="saveSpotSettings()">Save Spot</button>
+              <button onclick="openSpotDetails()">Open Details</button>
+            </div>
+          </div>
+        </div>
         <div><strong>Data</strong></div>
         <div style="margin-top:8px;">
           <label for="zones_json" style="font-weight:600; margin-bottom:4px; display:block;">Zones (JSON)</label>
@@ -119,11 +146,104 @@
       const canvas = document.getElementById('canvas');
       const ctx = canvas.getContext('2d');
       const canvasWrap = document.getElementById('canvasWrap');
-      const spotToolbar = document.getElementById('spotToolbar');
+      // Spots panel elements
+      const spotSearchInput = document.getElementById('spot_search');
+      const spotListEl = document.getElementById('spot_list');
+      const spotEditor = document.getElementById('spot_editor');
+      const spotEditIdEl = document.getElementById('spot_edit_id');
+      const spotNameInput = document.getElementById('spot_name');
+      const spotMinBitsInput = document.getElementById('spot_min_bits');
+      const spotStableMsInput = document.getElementById('spot_stable_ms');
+      const spotSizeEl = document.getElementById('spot_size');
       let baseW = 0, baseH = 0; // native frame size from backend
       const initW = canvas.width, initH = canvas.height; // initial canvas size (shrink target)
       let expanded = false; // false => 640x360, true => full native size
       let hoverSpotId = null; // track hover for selection hint
+      // Pointer/touch drag state
+      let dragging = false;
+      let dragSpotId = null;
+      let draggingVertexIndex = null; // if not null, dragging a specific vertex of selected spot
+      let dragStart = null; // {x,y} in native coords
+      let dragStartPoly = null; // deep copy of polygon at start
+      let downOnEmpty = false; // distinguish tap-to-add
+
+      function screenToNative(clientX, clientY){
+        const rect = canvas.getBoundingClientRect();
+        const sx = baseW ? (baseW / canvas.width) : 1;
+        const sy = baseH ? (baseH / canvas.height) : 1;
+        const x = Math.round((clientX - rect.left) * sx);
+        const y = Math.round((clientY - rect.top) * sy);
+        return { x, y };
+      }
+
+      function nativeToScreen(x, y){
+        const sx = baseW ? (canvas.width / baseW) : 1;
+        const sy = baseH ? (canvas.height / baseH) : 1;
+        return { x: x * sx, y: y * sy };
+      }
+
+      function polyBBox(poly){
+        if (!poly || !poly.length) return null;
+        const xs = poly.map(p=>p[0]); const ys = poly.map(p=>p[1]);
+        const x1 = Math.min(...xs), x2 = Math.max(...xs), y1 = Math.min(...ys), y2 = Math.max(...ys);
+        return { x1, y1, x2, y2 };
+      }
+
+      function hitSpotAt(x, y, tolPx=0){
+        // tolPx in screen px; convert to native units using average scale
+        const sx = baseW ? (baseW / canvas.width) : 1;
+        const sy = baseH ? (baseH / canvas.height) : 1;
+        const tol = Math.max(0, Math.round((tolPx * (sx + sy)) / 2));
+        for (let i=(spots||[]).length-1; i>=0; i--){
+          const s = spots[i];
+          const bb = polyBBox(s.polygon);
+          const insidePoly = pointInPoly([x,y], s.polygon);
+          const insideBBox = bb ? (x >= (bb.x1 - tol) && x <= (bb.x2 + tol) && y >= (bb.y1 - tol) && y <= (bb.y2 + tol)) : false;
+          if (insidePoly || insideBBox) return s;
+        }
+        return null;
+      }
+
+      function vertexNear(s, x, y, tolPx){
+        if (!s || !s.polygon) return -1;
+        // compare in screen space for tolerance
+        const p = nativeToScreen(x, y);
+        for (let i=0;i<s.polygon.length;i++){
+          const v = s.polygon[i];
+          const vs = nativeToScreen(v[0], v[1]);
+          const dx = vs.x - p.x, dy = vs.y - p.y;
+          const d2 = dx*dx + dy*dy;
+          if (d2 <= (tolPx*tolPx)) return i;
+        }
+        return -1;
+      }
+
+      function _distToSegSq(px, py, x1, y1, x2, y2){
+        const vx = x2 - x1, vy = y2 - y1;
+        const wx = px - x1, wy = py - y1;
+        const c1 = vx*wx + vy*wy;
+        if (c1 <= 0) return (px-x1)*(px-x1) + (py-y1)*(py-y1);
+        const c2 = vx*vx + vy*vy;
+        if (c2 <= c1) return (px-x2)*(px-x2) + (py-y2)*(py-y2);
+        const b = c1 / c2;
+        const bx = x1 + b*vx, by = y1 + b*vy;
+        return (px-bx)*(px-bx) + (py-by)*(py-by);
+      }
+
+      function edgeNear(s, x, y, tolPx){
+        if (!s || !s.polygon || s.polygon.length < 2) return -1;
+        // work in screen space
+        const p = nativeToScreen(x, y);
+        for (let i=0;i<s.polygon.length;i++){
+          const a = s.polygon[i];
+          const b = s.polygon[(i+1)%s.polygon.length];
+          const as = nativeToScreen(a[0], a[1]);
+          const bs = nativeToScreen(b[0], b[1]);
+          const d2 = _distToSegSq(p.x, p.y, as.x, as.y, bs.x, bs.y);
+          if (d2 <= tolPx*tolPx) return i; // edge between i and i+1
+        }
+        return -1;
+      }
 
       function applySize(){
         // If expanded and we know native size, use it; otherwise stay at initial size
@@ -189,7 +309,7 @@
         if (!selectedSpotId) return;
         spots = spots.filter(sp => sp.id !== selectedSpotId);
         selectedSpotId = null;
-        updateToolbar();
+        renderSpotList(); fillSpotEditor();
         draw();
       }
 
@@ -207,14 +327,14 @@
           const rx = dx*ca - dy*sa; const ry = dx*sa + dy*ca;
           return [cx + rx, cy + ry];
         });
-        updateToolbar();
+        fillSpotEditor();
         draw();
       }
 
       function updateSpotName(name){
         if (!selectedSpotId) return;
         const s = spots.find(sp => sp.id === selectedSpotId);
-        if (s) { s.name = (name || '').trim() || s.id; updateToolbar(); draw(); }
+        if (s) { s.name = (name || '').trim() || s.id; renderSpotList(); fillSpotEditor(); draw(); }
       }
 
       function selectedBBox(){
@@ -225,94 +345,80 @@
         return { x: x1, y: y1, w: x2-x1, h: y2-y1, name: s.name || s.id };
       }
 
-      function updateToolbar(){
+      // Spots panel rendering and editing
+      function renderSpotList(){
+        if (!spotListEl) return;
+        const q = (spotSearchInput && spotSearchInput.value || '').toLowerCase();
+        const items = (spots||[]).filter(sp => {
+          const t = ((sp.id||'') + ' ' + (sp.name||'')).toLowerCase();
+          return !q || t.includes(q);
+        });
+        spotListEl.innerHTML = '';
+        for (const sp of items){
+          const div = document.createElement('div');
+          div.className = 'list-item' + (sp.id === selectedSpotId ? ' active' : '');
+          div.innerHTML = `<span class="muted" style="font-size:12px;">${sp.id}</span> <span>${(sp.name||sp.id)}</span>`;
+          div.onclick = () => { selectedSpotId = sp.id; fillSpotEditor(); draw(); renderSpotList(); };
+          div.ondblclick = () => { const url = `/static/spot.html?spot=${encodeURIComponent(sp.id)}`; window.open(url, '_blank'); };
+          spotListEl.appendChild(div);
+        }
+      }
+
+      function fillSpotEditor(){
+        if (!spotEditor) return;
+        const s = spots.find(sp => sp.id === selectedSpotId);
+        if (!s){ spotEditor.style.display = 'none'; return; }
+        spotEditor.style.display = 'block';
+        if (spotEditIdEl) spotEditIdEl.textContent = s.id;
+        if (spotNameInput) spotNameInput.value = s.name || s.id;
         const box = selectedBBox();
-        if (!box){ spotToolbar.style.display = 'none'; window.__tb_last_id=null; return; }
-        spotToolbar.style.display = 'block';
-        // Pin toolbar to fixed corner (top-left of canvasWrap)
-        spotToolbar.style.left = '8px';
-        spotToolbar.style.top = '8px';
-        if (window.__tb_last_id === selectedSpotId){ return; }
-        window.__tb_last_id = selectedSpotId;
-        const safe = (s) => String(s||'').replace(/[&<>]/g, (c)=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]||c));
-          spotToolbar.innerHTML = `
-            <div style="display:flex; align-items:center; gap:6px;">
-              <input class="tb_name" name="spot_name" aria-label="Spot name" type="text" value="${safe(box.name)}" style="max-width:120px;"/>
-              <span class="muted" style="font-size:12px;">${Math.round(box.w)}×${Math.round(box.h)} px</span>
-              <label style="font-size:12px;">Min bits <input class="tb_minbits" name="min_bits" type="number" style="width:64px;"/></label>
-              <label style="font-size:12px;">Stable ms <input class="tb_stable" name="stable_ms" type="number" style="width:80px;"/></label>
-              <button class="tb_compare" title="Compare (prev vs current)">★</button>
-              <button class="tb_suggest" title="Suggest values based on size">Suggest</button>
-              <button class="tb_save">Save</button>
-              <button class="tb_rn">-10°</button>
-              <button class="tb_rp">+10°</button>
-              <button class="tb_del" style="color:#a00;">Delete</button>
-            </div>`;
-          const nameEl = spotToolbar.querySelector('.tb_name');
-          const minEl = spotToolbar.querySelector('.tb_minbits');
-          const stEl = spotToolbar.querySelector('.tb_stable');
-          const cmpEl = spotToolbar.querySelector('.tb_compare');
-          const suggestEl = spotToolbar.querySelector('.tb_suggest');
-          if (cmpEl) cmpEl.onclick = (e) => {
-            try {
-              e.stopPropagation();
-              const r = bboxToScreen(Math.round(box.x), Math.round(box.y), Math.round(box.x+box.w), Math.round(box.y+box.h));
-              const sid = selectedSpotId;
-              const prevUrl = (window.spotPrev && window.spotPrev[sid]) || null;
-              const curUrl = `/api/spot.jpg?id=${encodeURIComponent(sid)}&w=240&ts=${Date.now()}`;
-              const prevSig = (window.spotPrevSig && window.spotPrevSig[sid]) || null;
-              const curSig = (window.lastSigMap && window.lastSigMap[sid]) || null;
-              showComparisonPopup(sid, r || {x:0,y:0,w:0,h:0}, prevUrl, curUrl, prevSig, curSig);
-            } catch(err) { console.error(err); }
-          };
-          const saveEl = spotToolbar.querySelector('.tb_save');
-        const rnEl = spotToolbar.querySelector('.tb_rn');
-        const rpEl = spotToolbar.querySelector('.tb_rp');
-        const delEl = spotToolbar.querySelector('.tb_del');
-        // preload per-spot overrides from current zones data if available
+        if (spotSizeEl) spotSizeEl.textContent = box ? `${Math.round(box.w)}×${Math.round(box.h)} px` : '';
         (async () => {
           try {
             const z = await (await fetch('/api/zones')).json();
             const cfg = (z.spots||[]).find(sp=>sp.id===selectedSpotId) || {};
-            if (minEl) minEl.value = cfg.min_bits != null ? cfg.min_bits : '';
-            if (stEl) stEl.value = cfg.stable_ms != null ? cfg.stable_ms : '';
+            if (spotMinBitsInput) spotMinBitsInput.value = cfg.min_bits != null ? cfg.min_bits : '';
+            if (spotStableMsInput) spotStableMsInput.value = cfg.stable_ms != null ? cfg.stable_ms : '';
           } catch(e) {}
         })();
-        if (suggestEl) suggestEl.onclick = () => {
-          try {
-            // Estimate area fraction to suggest thresholds
-            const totalW = baseW || initW;
-            const totalH = baseH || initH;
-            const frac = (box.w * box.h) / Math.max(1, totalW * totalH);
-            let sugBits;
-            if (frac < 0.005) sugBits = 10;       // < 0.5%
-            else if (frac < 0.02) sugBits = 12;   // < 2%
-            else if (frac < 0.06) sugBits = 14;   // < 6%
-            else if (frac < 0.15) sugBits = 16;   // < 15%
-            else sugBits = 18;                    // larger regions
-            const sugStable = frac < 0.02 ? 1800 : (frac < 0.06 ? 1500 : 1200);
-            if (minEl) minEl.value = sugBits;
-            if (stEl) stEl.value = sugStable;
-          } catch(e) { console.error(e); }
-        };
-        if (saveEl) saveEl.onclick = async () => {
-          try {
-            const newName = nameEl ? (nameEl.value||'') : '';
-            const minBits = minEl && minEl.value !== '' ? parseInt(minEl.value,10) : null;
-            const stableMs = stEl && stEl.value !== '' ? parseInt(stEl.value,10) : null;
-            const z = await (await fetch('/api/zones')).json();
-            const spotsZ = z.spots || [];
-            for (const sp of spotsZ){ if (sp.id === selectedSpotId){ sp.name = newName || sp.id; if (minBits!==null) sp.min_bits = minBits; else delete sp.min_bits; if (stableMs!==null) sp.stable_ms = stableMs; else delete sp.stable_ms; break; } }
-            await fetch('/api/zones', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ spots: spotsZ }) });
-            // update local overlay
-            for (let i=0;i<spots.length;i++){ if (spots[i].id === selectedSpotId){ spots[i].name = newName || spots[i].id; break; } }
-          } catch(e) { console.error(e); }
-        };
-        if (rnEl) rnEl.onclick = () => rotateSelected(-10);
-        if (rpEl) rpEl.onclick = () => rotateSelected(10);
-        if (delEl) delEl.onclick = () => deleteSelected();
       }
-      window.addEventListener('resize', updateToolbar);
+
+      function onSpotNameInput(){ updateSpotName(spotNameInput ? spotNameInput.value : ''); }
+
+      async function saveSpotSettings(){
+        if (!selectedSpotId) return;
+        try {
+          const newName = spotNameInput ? (spotNameInput.value||'') : '';
+          const minBits = spotMinBitsInput && spotMinBitsInput.value !== '' ? parseInt(spotMinBitsInput.value,10) : null;
+          const stableMs = spotStableMsInput && spotStableMsInput.value !== '' ? parseInt(spotStableMsInput.value,10) : null;
+          const z = await (await fetch('/api/zones')).json();
+          const spotsZ = z.spots || [];
+          for (const sp of spotsZ){ if (sp.id === selectedSpotId){ sp.name = newName || sp.id; if (minBits!==null) sp.min_bits = minBits; else delete sp.min_bits; if (stableMs!==null) sp.stable_ms = stableMs; else delete sp.stable_ms; break; } }
+          await fetch('/api/zones', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ spots: spotsZ }) });
+          for (let i=0;i<spots.length;i++){ if (spots[i].id === selectedSpotId){ spots[i].name = newName || spots[i].id; break; } }
+          renderSpotList();
+        } catch(e) { console.error(e); }
+      }
+
+      function openSpotDetails(){
+        if (!selectedSpotId) return;
+        const url = `/static/spot.html?spot=${encodeURIComponent(selectedSpotId)}`;
+        window.open(url, '_blank');
+      }
+
+      function compareSelected(){
+        if (!selectedSpotId) return;
+        try {
+          const box = selectedBBox();
+          const r = box ? bboxToScreen(Math.round(box.x), Math.round(box.y), Math.round(box.x+box.w), Math.round(box.y+box.h)) : {x:0,y:0,w:0,h:0};
+          const sid = selectedSpotId;
+          const prevUrl = (window.spotPrev && window.spotPrev[sid]) || null;
+          const curUrl = `/api/spot.jpg?id=${encodeURIComponent(sid)}&w=240&ts=${Date.now()}`;
+          const prevSig = (window.spotPrevSig && window.spotPrevSig[sid]) || null;
+          const curSig = (window.lastSigMap && window.lastSigMap[sid]) || null;
+          showComparisonPopup(sid, r, prevUrl, curUrl, prevSig, curSig);
+        } catch(err) { console.error(err); }
+      }
 
       function toggleSize(){
         expanded = !expanded;
@@ -320,21 +426,95 @@
         draw();
       }
 
-      // Hover feedback to indicate click-to-select
-      canvas.addEventListener('mousemove', (e) => {
-        const rect = canvas.getBoundingClientRect();
-        const sx = baseW ? (baseW / canvas.width) : 1;
-        const sy = baseH ? (baseH / canvas.height) : 1;
-        const x = Math.round((e.clientX - rect.left) * sx);
-        const y = Math.round((e.clientY - rect.top) * sy);
-        const hit = (spots||[]).slice().reverse().find(s => pointInPoly([x,y], s.polygon));
+      // Pointer/touch + mouse unified interactions
+      function updateHover(clientX, clientY){
+        const {x, y} = screenToNative(clientX, clientY);
+        const hit = hitSpotAt(x, y, 6);
         const newHover = hit ? hit.id : null;
         if (newHover !== hoverSpotId){
           hoverSpotId = newHover;
           canvasWrap.style.cursor = hoverSpotId ? 'pointer' : 'default';
           draw();
         }
-      });
+      }
+
+      canvas.addEventListener('pointerdown', (e) => {
+        try { canvas.setPointerCapture(e.pointerId); } catch(err) {}
+        downOnEmpty = false;
+        const {x, y} = screenToNative(e.clientX, e.clientY);
+        const isTouch = e.pointerType === 'touch';
+        const hit = hitSpotAt(x, y, isTouch ? 16 : 6);
+        if (hit){
+          selectedSpotId = hit.id;
+          fillSpotEditor(); renderSpotList();
+          const s = spots.find(sp => sp.id === hit.id);
+          // Shift+click near edge to insert a new vertex
+          if (e.shiftKey && s){
+            const ei = edgeNear(s, x, y, isTouch ? 24 : 10);
+            if (ei >= 0){
+              s.polygon.splice(ei+1, 0, [x, y]);
+              draw();
+              e.preventDefault();
+              return;
+            }
+          }
+          // If near a vertex, drag that vertex
+          const vi = s ? vertexNear(s, x, y, isTouch ? 20 : 10) : -1;
+          if (vi >= 0){
+            dragging = true; dragSpotId = hit.id; draggingVertexIndex = vi; dragStart = null; dragStartPoly = null;
+          } else {
+            // Drag whole shape
+            dragging = true; dragSpotId = hit.id; dragStart = {x, y};
+            dragStartPoly = s && s.polygon ? s.polygon.map(p => [p[0], p[1]]) : null;
+          }
+        } else {
+          // Track that we pressed on empty space to allow tap-to-add on pointerup
+          downOnEmpty = true;
+        }
+        e.preventDefault();
+      }, { passive: false });
+
+      canvas.addEventListener('pointermove', (e) => {
+        if (!dragging){ updateHover(e.clientX, e.clientY); return; }
+        if (!dragSpotId) return;
+        const {x, y} = screenToNative(e.clientX, e.clientY);
+        const s = spots.find(sp => sp.id === dragSpotId);
+        if (!s) return;
+        if (draggingVertexIndex !== null && draggingVertexIndex >= 0){
+          s.polygon[draggingVertexIndex] = [x, y];
+          draw();
+        } else if (dragStart && dragStartPoly){
+          const dx = x - dragStart.x; const dy = y - dragStart.y;
+          s.polygon = dragStartPoly.map(p => [p[0] + dx, p[1] + dy]);
+          draw();
+        }
+        e.preventDefault();
+      }, { passive: false });
+
+      function endPointer(e){
+        const wasDragging = dragging;
+        const wasDownOnEmpty = downOnEmpty;
+        const {x, y} = screenToNative(e.clientX, e.clientY);
+        // Reset drag state first
+        dragging = false; dragSpotId = null; draggingVertexIndex = null; dragStart = null; dragStartPoly = null;
+        try { canvas.releasePointerCapture(e.pointerId); } catch(err) {}
+        // If it was a tap on empty, add a new spot
+        if (!wasDragging && wasDownOnEmpty){
+          const id = 'spot_' + (spots.length + 1);
+          let poly = rectPolygon(x, y, DEFAULT_SPOT.w, DEFAULT_SPOT.h);
+          spots.push({ id, name: id, polygon: poly });
+          selectedSpotId = id; fillSpotEditor(); renderSpotList(); renderZonesView(); draw();
+        } else if (!wasDragging) {
+          // It was a tap over an existing spot: select it
+          const hit = hitSpotAt(x, y, e.pointerType === 'touch' ? 16 : 6);
+          if (hit){ selectedSpotId = hit.id; fillSpotEditor(); renderSpotList(); draw(); }
+        }
+        e.preventDefault();
+      }
+      canvas.addEventListener('pointerup', endPointer, { passive: false });
+      canvas.addEventListener('pointercancel', endPointer, { passive: false });
+
+      // Maintain hover feedback for mouse users when not dragging
       canvas.addEventListener('mouseleave', () => { hoverSpotId = null; canvasWrap.style.cursor = 'default'; draw(); });
 
 
@@ -357,33 +537,51 @@
               if (s.id === selectedSpotId) {
                 ctx.strokeStyle = '#ffaa00'; ctx.lineWidth = 2; ctx.setLineDash([6,4]);
                 ctx.stroke(); ctx.setLineDash([]); ctx.strokeStyle = '#44aaff';
+                // draw vertex handles
+                try {
+                  ctx.save();
+                  for (let i=0;i<s.polygon.length;i++){
+                    const v = s.polygon[i];
+                    const vx = v[0]*sx, vy = v[1]*sy;
+                    ctx.beginPath();
+                    ctx.fillStyle = '#fff';
+                    ctx.strokeStyle = '#ff8800';
+                    ctx.lineWidth = 2;
+                    ctx.arc(vx, vy, 5, 0, Math.PI*2);
+                    ctx.fill(); ctx.stroke();
+                  }
+                  ctx.restore();
+                } catch(e) {}
               }
             }
           }
-          updateToolbar();
+          fillSpotEditor();
         };
         img.src = '/frame.jpg?ts=' + Date.now();
       }
 
+      // Mouse click remains for old browsers; pointer handlers will handle most cases
       canvas.addEventListener('click', async (e) => {
-        const rect = canvas.getBoundingClientRect();
-        const sx = baseW ? (baseW / canvas.width) : 1;
-        const sy = baseH ? (baseH / canvas.height) : 1;
-        const x = Math.round((e.clientX - rect.left) * sx);
-        const y = Math.round((e.clientY - rect.top) * sy);
-        const hit = (spots||[]).slice().reverse().find(s => pointInPoly([x,y], s.polygon));
-        if (hit) {
-          selectedSpotId = hit.id;
-          updateToolbar();
-        } else {
+        const {x, y} = screenToNative(e.clientX, e.clientY);
+        const hit = hitSpotAt(x, y, 6);
+        if (hit) { selectedSpotId = hit.id; fillSpotEditor(); renderSpotList(); }
+        else {
           const id = 'spot_' + (spots.length + 1);
           let poly = rectPolygon(x, y, DEFAULT_SPOT.w, DEFAULT_SPOT.h);
           spots.push({ id, name: id, polygon: poly });
-          selectedSpotId = id;
-          updateToolbar();
+          selectedSpotId = id; fillSpotEditor(); renderSpotList();
         }
-        renderZonesView();
-        draw();
+        renderZonesView(); draw();
+      });
+
+      // Double-click to open spot details page
+      canvas.addEventListener('dblclick', (e) => {
+        const {x, y} = screenToNative(e.clientX, e.clientY);
+        const hit = hitSpotAt(x, y, 8);
+        if (hit){
+          const url = `/static/spot.html?spot=${encodeURIComponent(hit.id)}`;
+          window.open(url, '_blank');
+        }
       });
 
       document.addEventListener('keydown', (e) => {
@@ -393,7 +591,7 @@
         const step = (e.shiftKey ? 10 : 5);
         if (e.key === 'Delete' || e.key === 'Backspace') {
           spots = spots.filter(sp => sp.id !== selectedSpotId);
-          selectedSpotId = null; renderZonesView(); draw(); e.preventDefault(); return;
+          selectedSpotId = null; renderZonesView(); renderSpotList(); fillSpotEditor(); draw(); e.preventDefault(); return;
         }
         let dx = 0, dy = 0;
         if (e.key === 'ArrowLeft') dx = -step;
@@ -410,6 +608,7 @@
         const payload = { spots };
         await fetch('/api/zones', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
         alert('Saved');
+        renderSpotList();
       }
 
       async function loadZones(){
@@ -417,9 +616,11 @@
         const z = await res.json();
         spots = z.spots || [];
         renderZonesView();
+        renderSpotList();
+        fillSpotEditor();
       }
 
-      function clearSpots(){ spots = []; selectedSpotId = null; draw(); }
+      function clearSpots(){ spots = []; selectedSpotId = null; renderSpotList(); fillSpotEditor(); draw(); }
       function renderZonesView(){ /* we keep homepage minimal; could add JSON preview if desired */ }
 
       // Slow down frame refresh to reduce flicker while editing
