@@ -13,6 +13,7 @@ No separate CLI is needed; everything runs behind the webserver.
 
 - Copy `.env.example` to `.env` and set `RTSP_URL`.
 - Optionally set `DATA_DIR` (default `./data`) and `AUTO_START=true|false`.
+- RTSP is opened via FFmpeg with TCP by default for reliability. You can override with `RTSP_TRANSPORT=udp` if your camera requires UDP.
 
 2) Install deps (using uv or pip)
 
@@ -62,3 +63,8 @@ Environment knobs (with sane defaults):
 - `MAX_STORAGE_GB` (default: 10)
 
 Use the Data panel → Images to view summary and cleanup orphans. You can also trigger retention manually via `POST /api/retention/apply`.
+
+## Capture reliability
+
+- RTSP is opened with the FFmpeg backend and `rtsp_transport=tcp` (plus a 5s socket timeout) by default to reduce packet loss and stream breakage.
+- The capture loop drops likely garbage frames (all-black/white or extremely low-variance grey) and resyncs after consecutive bad reads or idle periods. This prevents corrupt frames from propagating into event detection.

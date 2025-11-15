@@ -61,11 +61,71 @@ class VideoCaptureWorker:
         log = logging.getLogger("uvicorn.error")
 
         def _open() -> cv2.VideoCapture:
-            cap_local = cv2.VideoCapture(self.source)
+            import os
+
+            # Prefer TCP transport for RTSP to avoid UDP packet loss.
+            # Use OpenCV FFmpeg backend with capture options when available.
+            backend = getattr(cv2, "CAP_FFMPEG", 1900)
+            if str(self.source).lower().startswith("rtsp"):
+                # Allow override via env var: RTSP_TRANSPORT=udp|tcp (default tcp)
+                rtsp_transport = os.getenv("RTSP_TRANSPORT", "tcp").lower()
+                # Apply FFmpeg capture options: transport + a sane socket timeout.
+                # stimeout is in microseconds; here ~5s.
+                opts = f"rtsp_transport;{rtsp_transport}|stimeout;5000000"
+                # Avoid clobbering unrelated options if user already set them; merge best-effort.
+                existing = os.getenv("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+                if existing and existing != opts:
+                    # Simple merge without duplicates
+                    kv = {tuple(p.split(";", 1)) for p in existing.split("|") if ";" in p}
+                    for part in opts.split("|"):
+                        if ";" in part:
+                            kv.add(tuple(part.split(";", 1)))
+                    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "|".join(
+                        f"{k};{v}" for (k, v) in kv
+                    )
+                else:
+                    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = opts
+                try:
+                    cap_local = cv2.VideoCapture(self.source, backend)
+                except Exception:
+                    cap_local = cv2.VideoCapture(self.source)
+            else:
+                cap_local = cv2.VideoCapture(self.source)
             if not cap_local.isOpened():
                 time.sleep(max(0.05, self.reopen_delay_ms / 1000.0))
-                cap_local = cv2.VideoCapture(self.source)
+                try:
+                    cap_local = cv2.VideoCapture(self.source, backend)
+                except Exception:
+                    cap_local = cv2.VideoCapture(self.source)
             return cap_local
+
+        def _valid_frame(img: np.ndarray) -> bool:
+            try:
+                if img is None:
+                    return False
+                if not isinstance(img, np.ndarray):
+                    return False
+                if img.ndim not in (2, 3):
+                    return False
+                h, w = img.shape[:2]
+                if h <= 0 or w <= 0:
+                    return False
+                # Most streams are color; tolerate grayscale, but ensure dtype/values sane
+                if img.dtype != np.uint8:
+                    return False
+                # Fast heuristics: reject near-uniform or all-black/white frames
+                small = cv2.resize(img, (64, 36), interpolation=cv2.INTER_AREA)
+                if small.ndim == 3:
+                    small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+                mean = float(np.mean(small))
+                std = float(np.std(small))
+                if mean < 2.0 or mean > 253.0:
+                    return False
+                if std < 2.0:  # extremely low detail; likely grey/garbage
+                    return False
+                return True
+            except Exception:
+                return False
 
         cap = _open()
         self.state.running = cap.isOpened()
@@ -84,7 +144,7 @@ class VideoCaptureWorker:
 
                 ok, frame = cap.read()
                 ts = time.time()
-                if not ok or frame is None:
+                if not ok or frame is None or not _valid_frame(frame):
                     consecutive_fail += 1
                     # Resync on too many consecutive failures or idle
                     idle_ms = (ts - last_good_ts) * 1000.0

@@ -106,6 +106,21 @@ class EventStore:
             cur = con.execute("DELETE FROM events WHERE id = ?", (int(event_id),))
             return cur.rowcount > 0
 
+    def clear(self) -> int:
+        """Delete all events. Returns number of rows deleted (best-effort)."""
+        with sqlite3.connect(self.db_path) as con:
+            try:
+                cur = con.execute("SELECT COUNT(*) FROM events")
+                before = int(cur.fetchone()[0]) if cur else 0
+            except Exception:
+                before = 0
+            con.execute("DELETE FROM events")
+            try:
+                con.execute("VACUUM")
+            except Exception:
+                pass
+            return before
+
     def referenced_images(self) -> Set[str]:
         """Return set of image filenames referenced by any event meta."""
         out: Set[str] = set()

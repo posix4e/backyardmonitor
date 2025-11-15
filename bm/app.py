@@ -479,6 +479,28 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "Event not found")
         return {"ok": True}
 
+    @app.post("/api/events/clear", response_class=JSONResponse)
+    async def clear_events():
+        # Remove all referenced images first, then clear DB
+        try:
+            ref = state.events.referenced_images()
+            for name in list(ref):
+                p = state.frames_dir / str(name)
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        deleted = state.events.clear()
+        # Also reset compare baseline so helper endpoints ignore older cache
+        try:
+            state.compare_baseline_ts = time.time()
+        except Exception:
+            pass
+        return {"ok": True, "deleted": int(deleted)}
+
 
     @app.get("/api/event_explain", response_class=JSONResponse)
     async def event_explain(id: int):
