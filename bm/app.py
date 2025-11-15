@@ -734,9 +734,16 @@ def create_app() -> FastAPI:
                                                         meta["image_thumb"] = (
                                                             thumb_path.name
                                                         )
-                                                    state.events.add(
+                                                    ev_id = state.events.add(
                                                         "spot_change", meta
                                                     )
+                                                    try:
+                                                        # For gate spots, trigger LLM once on entry to describe what is seen
+                                                        cat = (getattr(s, "category", None) or "").strip().lower()
+                                                        if state.llm and cat == "gate":
+                                                            state._queue_llm_burst(int(ev_id), meta)
+                                                    except Exception:
+                                                        pass
                                                 except Exception:
                                                     pass
                                                 rec["state"] = "occupied"
@@ -863,7 +870,11 @@ def create_app() -> FastAPI:
                                                 meta["image_thumb"] = thumb_path.name
                                             ev_id = state.events.add("spot_change", meta)
                                             try:
-                                                if state.llm and bool(meta.get("has_prev")):
+                                                # Queue LLM differently by category:
+                                                # - Gate: handled on entry only; do not queue on exit
+                                                # - Others: use previous/compare flow (requires has_prev)
+                                                cat = (getattr(s, "category", None) or "").strip().lower()
+                                                if state.llm and cat != "gate" and bool(meta.get("has_prev")):
                                                     state._queue_llm_burst(int(ev_id), meta)
                                             except Exception:
                                                 pass

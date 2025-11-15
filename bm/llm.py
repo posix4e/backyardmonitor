@@ -134,19 +134,43 @@ class LLMWorker:
         # Idempotence: skip if already done
         if str(meta.get("llm_status", "")).lower() == "done":
             return
+        # Determine spot category (gate vs spot) from zones.json co-located with frames dir
+        cat = ""
+        try:
+            from .zones import load_zones
+            zones_path = self.frames_dir.parent / "zones.json"
+            z = load_zones(zones_path)
+            sid = str((meta.get("spot_id") or "").strip())
+            sp = next((s for s in z.spots if s.id == sid), None)
+            if sp and getattr(sp, "category", None):
+                cat = str(sp.category or "").strip().lower()
+        except Exception:
+            cat = ""
+        # For gate, avoid exit duplicates and do single-image description
+        if cat == "gate" and str(meta.get("state") or "").lower() == "exit":
+            return
         # Prepare input
         img_b64, img_src_key = self._read_image_b64(meta)
         prev_ev = self._find_prev_event(ev)
         prev_b64, prev_src_key = (None, None)
-        if prev_ev is not None:
+        if cat != "gate" and prev_ev is not None:
             prev_b64, prev_src_key = self._read_image_b64(prev_ev.get("meta") or {})
-        prompt = (
-            "You are an assistant that classifies whether a changed region of a fixed camera is a meaningful change. "
-            "You may be given two images: image 1 is the PREVIOUS scene and image 2 is the CURRENT scene. "
-            "Identify if there is a meaningful change (e.g., new/removed person/vehicle/animal) vs trivial lighting/noise. "
-            "Return strict JSON with the following keys: significant (boolean), reason (short string), "
-            "and bbox (array [x1,y1,x2,y2] of normalized coordinates 0..1 in the CURRENT image). If unsure, use [0,0,0,0]."
-        )
+        # Build prompt: gate → describe single image; others → compare previous vs current
+        if cat == "gate":
+            prompt = (
+                "You are watching a fixed camera's gate region. You will receive ONE image. "
+                "Briefly describe what you see passing through or present (e.g., person, vehicle, animal), include color and count if obvious. "
+                "Return strict JSON with: significant (boolean: true if a primary subject is present), "
+                "reason (short description), and bbox (array [x1,y1,x2,y2] normalized 0..1 in the image; [0,0,0,0] if not clear)."
+            )
+        else:
+            prompt = (
+                "You are an assistant that classifies whether a changed region of a fixed camera is a meaningful change. "
+                "You may be given two images: image 1 is the PREVIOUS scene and image 2 is the CURRENT scene. "
+                "Identify if there is a meaningful change (e.g., new/removed person/vehicle/animal) vs trivial lighting/noise. "
+                "Return strict JSON with the following keys: significant (boolean), reason (short string), "
+                "and bbox (array [x1,y1,x2,y2] of normalized coordinates 0..1 in the CURRENT image). If unsure, use [0,0,0,0]."
+            )
         significant = False
         reason = ""
         provider = (override_provider or self.cfg.provider or "openrouter").strip().lower()
@@ -163,7 +187,8 @@ class LLMWorker:
                 client = OpenAI()
                 # Prepare messages, include previous then current when available
                 content = [{"type": "text", "text": prompt}]
-                if prev_b64:
+                # Gate: single image; otherwise include previous then current when available
+                if cat != "gate" and prev_b64:
                     content.append({"type": "image_url", "image_url": {"url": prev_b64}})
                 if img_b64:
                     content.append({"type": "image_url", "image_url": {"url": img_b64}})
@@ -208,7 +233,7 @@ class LLMWorker:
                     raise RuntimeError("openrouter_api_key_missing")
                 url = "https://openrouter.ai/api/v1/chat/completions"
                 content = [{"type": "text", "text": prompt}]
-                if prev_b64:
+                if cat != "gate" and prev_b64:
                     content.append({"type": "image_url", "image_url": {"url": prev_b64}})
                 if img_b64:
                     content.append({"type": "image_url", "image_url": {"url": img_b64}})
@@ -270,12 +295,12 @@ class LLMWorker:
                 meta_out["llm_response"] = txt[:2000]
             if img_src_key:
                 meta_out["llm_image_source"] = img_src_key
-            if prev_ev is not None:
+            if cat != "gate" and prev_ev is not None:
                 try:
                     meta_out["llm_prev_event_id"] = int(prev_ev.get("id"))
                 except Exception:
                     pass
-            if prev_src_key:
+            if cat != "gate" and prev_src_key:
                 meta_out["llm_prev_image_source"] = prev_src_key
             if error_msg:
                 meta_out["llm_error"] = error_msg
