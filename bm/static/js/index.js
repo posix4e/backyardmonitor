@@ -1017,6 +1017,7 @@ async function explainEvent(id) {
               <div style="margin-top:8px; display:flex; gap:8px;">
                 ${spotId ? `<a href="/static/spot.html?spot=${encodeURIComponent(spotId)}&event=${encodeURIComponent(String(ev.id))}" target="_blank">Open spot timeline ↗</a>` : ''}
                 <button id="btn_llm_queue">Analyze now</button>
+                <a href="/static/significance.html?event=${encodeURIComponent(String(ev.id))}" target="_blank">Open significance view ↗</a>
                 <button id="btn_close">Close</button>
               </div>
             </div>
