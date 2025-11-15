@@ -24,6 +24,21 @@ async function loadExplain(eventId) {
         if (ex.min_bits_used != null) lines.push(`min_bits_used: ${ex.min_bits_used}`);
         if (ex.stable_ms_config != null) lines.push(`stable_ms: ${ex.stable_ms_config}`);
         if (typeof ex.meets_threshold === 'boolean') lines.push(`meets_threshold: ${ex.meets_threshold}`);
+        try {
+            // Enrich with LLM view by fetching event directly
+            const ev = await (await fetch(`/api/events/${encodeURIComponent(String(eventId))}`)).json();
+            const m = ev && ev.meta ? ev.meta : {};
+            if (m.llm_status || m.llm_attempted) {
+                lines.push('');
+                lines.push('[LLM]');
+                lines.push(`status: ${m.llm_status || '-'}`);
+                if (m.significant != null) lines.push(`significant: ${!!m.significant}`);
+                if (m.llm_reason) lines.push(`reason: ${m.llm_reason}`);
+                if (m.llm_error) lines.push(`error: ${m.llm_error}`);
+                if (m.llm_provider) lines.push(`provider: ${m.llm_provider}`);
+                if (m.llm_model) lines.push(`model: ${m.llm_model}`);
+            }
+        } catch (e) {}
         document.getElementById('explain').textContent = lines.join('\n');
     } catch (e) {
         /* ignore */
@@ -57,7 +72,8 @@ async function load() {
 
     // Load spot history (newest first)
     const lim = parseInt((document.getElementById('limit').value || '60'), 10);
-    const hist = await (await fetch(`/api/spot_history?spot_id=${encodeURIComponent(spotId)}&limit=${encodeURIComponent(String(lim))}`)).json();
+    const sigOnly = !!(document.getElementById('sig_only') && document.getElementById('sig_only').checked);
+    const hist = await (await fetch(`/api/spot_history?spot_id=${encodeURIComponent(spotId)}&limit=${encodeURIComponent(String(lim))}&significant_only=${sigOnly ? '1' : '0'}`)).json();
     const items = (hist && hist.items) ? hist.items : [];
     const grid = document.getElementById('timeline');
     if (!items.length) {
@@ -65,7 +81,8 @@ async function load() {
         try {
             const j = await (await fetch('/api/events?limit=500')).json();
             const all = (j && j.items) ? j.items : [];
-            const filt = all.filter(it => String((it.meta && it.meta.spot_id) || '') === String(spotId) && String(it.kind || '').toLowerCase() === 'spot_change');
+            let filt = all.filter(it => String((it.meta && it.meta.spot_id) || '') === String(spotId) && String(it.kind || '').toLowerCase() === 'spot_change');
+            if (sigOnly) filt = filt.filter(it => !!(it.meta && it.meta.significant));
             if (!filt.length) {
                 grid.innerHTML = '<div class="muted">No events for this spot yet.</div>';
                 return;

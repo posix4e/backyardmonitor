@@ -131,6 +131,10 @@
                      value="50"
                      min="1"
                      style="width:70px" />
+              <label class="muted" title="Only show events marked significant by LLM">
+                <input type="checkbox" id="events_sig_only" />
+                Significant only
+              </label>
               <button style="margin-left:auto; color:#a00;" onclick="clearAllEvents()">
                 Clear All Events
               </button>
@@ -229,6 +233,14 @@
                      min="0"
                      max="1"
                      style="width:120px" />
+              <label for="roi_diff_cooldown_ms">Cooldown (ms)</label>
+              <input type="number"
+                     id="roi_diff_cooldown_ms"
+                     name="roi_diff_cooldown_ms"
+                     value="0"
+                     min="0"
+                     step="100"
+                     style="width:120px" />
               <label for="phash_ms">Stable window (ms)</label>
               <input type="number"
                      id="phash_ms"
@@ -251,6 +263,10 @@
               <button onclick="loadImagesSummary()">Refresh Summary</button>
               <button onclick="cleanupOrphans()">Cleanup Orphans</button>
               <button onclick="loadThumbnails()">Show Latest Thumbnails</button>
+              <label class="muted" title="Only show LLM-significant changes">
+                <input type="checkbox" id="thumb_sig_only" />
+                Significant only
+              </label>
             </div>
             <div id="images_summary" class="muted"></div>
             <div id="thumb_grid"

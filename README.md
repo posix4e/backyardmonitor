@@ -43,6 +43,16 @@ Quick run locally:
   - Run on all files: `uvx pre-commit run --all-files`
   - Config lives in `.pre-commit-config.yaml`; Black options are in `pyproject.toml` under `[tool.black]`.
 
+## Style (Format + Lint)
+
+- One-shot (fix): `make style`
+- Check only (no writes): `make style-check`
+- Individual:
+  - Format: `make format` (or `make format-check`)
+  - Lint: `make lint`
+
+Requires dev tools: `uv sync --group dev` (Black, Pyflakes, djlint, jsbeautifier).
+
 ## Calibrate
 
 - Spots

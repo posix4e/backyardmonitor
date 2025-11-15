@@ -55,6 +55,11 @@ class Settings:
     category_road_min_pixels: int = 1200
     category_road_cooldown_ms: int = 5000
     category_road_flow_mag_min: float = 1.0
+    # LLM analysis
+    llm_enabled: bool = False
+    llm_provider: str = "openai"
+    llm_model_fast: str = "gpt-4o-mini"
+    llm_timeout_sec: int = 20
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -204,6 +209,19 @@ class Settings:
         category_road_min_pixels = _int("CATEGORY_ROAD_MIN_PIXELS", 1200)
         category_road_cooldown_ms = _int("CATEGORY_ROAD_COOLDOWN_MS", 5000)
         category_road_flow_mag_min = _float("CATEGORY_ROAD_FLOW_MAG_MIN", 1.0)
+        # LLM
+        llm_enabled = os.getenv("LLM_ENABLED", "false").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        llm_provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+        llm_model_fast = os.getenv("LLM_MODEL_FAST", "gpt-4o-mini").strip()
+        try:
+            llm_timeout_sec = int(os.getenv("LLM_TIMEOUT_SEC", "20"))
+        except Exception:
+            llm_timeout_sec = 20
 
         return cls(
             rtsp_url=rtsp_url,
@@ -247,4 +265,8 @@ class Settings:
             category_road_min_pixels=category_road_min_pixels,
             category_road_cooldown_ms=category_road_cooldown_ms,
             category_road_flow_mag_min=category_road_flow_mag_min,
+            llm_enabled=llm_enabled,
+            llm_provider=llm_provider,
+            llm_model_fast=llm_model_fast,
+            llm_timeout_sec=llm_timeout_sec,
         )

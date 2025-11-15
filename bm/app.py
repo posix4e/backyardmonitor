@@ -13,6 +13,7 @@ from .capture import VideoCaptureWorker
 from .storage import EventStore
 from .analyzer import AnalysisWorker
 from .zones import load_zones, save_zones
+from .llm import LLMWorker, LLMConfig
 
 
 class AppState:
@@ -29,6 +30,7 @@ class AppState:
         self.events = EventStore(self.db_path)
         self.capture: Optional[VideoCaptureWorker] = None
         self.analysis: Optional[AnalysisWorker] = None
+        self.llm: Optional[LLMWorker] = None
         # in-memory spot image signature tracker: { spot_id: {sig: str, since: float} }
         self.spot_tracker: dict[str, dict[str, float | str]] = {}
         # Comparison filtering baseline (events older than this ts are ignored for prev/compare)
@@ -109,6 +111,19 @@ def create_app() -> FastAPI:
                     _t.sleep(3600)
 
             threading.Thread(target=_retention_loop, daemon=True).start()
+        except Exception:
+            pass
+        # Start LLM worker if enabled
+        try:
+            if settings.llm_enabled:
+                cfg = LLMConfig(
+                    provider=settings.llm_provider,
+                    model_fast=settings.llm_model_fast,
+                    timeout_sec=int(settings.llm_timeout_sec or 20),
+                )
+                llm = LLMWorker(state.frames_dir, state.events, cfg)
+                llm.start()
+                state.llm = llm
         except Exception:
             pass
 
@@ -283,6 +298,19 @@ def create_app() -> FastAPI:
                 return None
 
         stats = []
+
+        # Helper: whether there is a previous event for this spot after the compare baseline
+        def _has_prev_event(spot_id: str) -> bool:
+            try:
+                baseline = float(state.compare_baseline_ts or 0.0)
+                prevs = state.events.spot_events(spot_id, 1)
+                if not prevs:
+                    return False
+                ts_prev = float(prevs[0].get("ts") or 0.0)
+                return ts_prev > 0.0 and (baseline <= 0.0 or ts_prev >= baseline)
+            except Exception:
+                return False
+
         for s in zones.spots:
             xs = [p[0] for p in s.polygon] or [0]
             ys = [p[1] for p in s.polygon] or [0]
@@ -493,6 +521,12 @@ def create_app() -> FastAPI:
                                                         "method": "roi_diff",
                                                         "state": "enter",
                                                     }
+                                                    try:
+                                                        meta["has_prev"] = bool(_has_prev_event(s.id))
+                                                        if not meta["has_prev"]:
+                                                            meta["significant"] = False
+                                                    except Exception:
+                                                        pass
                                                     if (
                                                         state.settings.store_full_frames
                                                         and full_path.exists()
@@ -590,6 +624,12 @@ def create_app() -> FastAPI:
                                                 "method": "roi_diff",
                                                 "state": "exit",
                                             }
+                                            try:
+                                                meta["has_prev"] = bool(_has_prev_event(s.id))
+                                                if not meta["has_prev"]:
+                                                    meta["significant"] = False
+                                            except Exception:
+                                                pass
                                             if (
                                                 state.settings.store_full_frames
                                                 and full_path.exists()
@@ -605,7 +645,14 @@ def create_app() -> FastAPI:
                                                 and thumb_path.exists()
                                             ):
                                                 meta["image_thumb"] = thumb_path.name
-                                            state.events.add("spot_change", meta)
+                                            ev_id = state.events.add(
+                                                "spot_change", meta
+                                            )
+                                            try:
+                                                if state.llm and bool(meta.get("has_prev")):
+                                                    state.llm.queue(int(ev_id))
+                                            except Exception:
+                                                pass
                                         except Exception:
                                             pass
                                         rec["state"] = "empty"
@@ -753,6 +800,12 @@ def create_app() -> FastAPI:
                                                 "new_sig": sig,
                                                 "delta_bits": delta_bits,
                                             }
+                                            try:
+                                                meta["has_prev"] = bool(_has_prev_event(s.id))
+                                                if not meta["has_prev"]:
+                                                    meta["significant"] = False
+                                            except Exception:
+                                                pass
                                             if (
                                                 state.settings.store_full_frames
                                                 and full_path.exists()
@@ -768,7 +821,12 @@ def create_app() -> FastAPI:
                                                 and thumb_path.exists()
                                             ):
                                                 meta["image_thumb"] = thumb_path.name
-                                            state.events.add("spot_change", meta)
+                                            ev_id = state.events.add("spot_change", meta)
+                                            try:
+                                                if state.llm and bool(meta.get("has_prev")):
+                                                    state.llm.queue(int(ev_id))
+                                            except Exception:
+                                                pass
                                         except Exception:
                                             pass
                                         state.spot_tracker[s.id] = {
@@ -1187,7 +1245,7 @@ def create_app() -> FastAPI:
     # Thumbnail and image helpers
 
     @app.get("/api/thumbnails", response_class=JSONResponse)
-    async def thumbnails(limit: int = 60):
+    async def thumbnails(limit: int = 60, significant_only: bool = False):
         items = []
         for e in state.events.recent(max(0, int(limit))):
             meta = e.get("meta") or {}
@@ -1198,6 +1256,12 @@ def create_app() -> FastAPI:
             )
             if not thumb:
                 continue
+            if significant_only:
+                try:
+                    if not bool(meta.get("significant")):
+                        continue
+                except Exception:
+                    continue
             items.append(
                 {
                     "event_id": e["id"],
@@ -1457,7 +1521,12 @@ def create_app() -> FastAPI:
             "PHASH_STABLE_MS": int(settings.phash_stable_ms or 0),
             "ROI_DIFF_ALPHA": float(settings.roi_diff_alpha or 0.05),
             "ROI_DIFF_THRESHOLD": float(settings.roi_diff_threshold or 0.02),
-            "ROI_DIFF_MIN_PIXELS": int(settings.roi_diff_min_pixels or 0),
+            "ROI_DIFF_MIN_PIXELS": int(
+                getattr(settings, "roi_diff_min_pixels", 0) or 0
+            ),
+            "ROI_DIFF_COOLDOWN_MS": int(
+                getattr(settings, "roi_diff_cooldown_ms", 0) or 0
+            ),
             # category defaults
             "CATEGORY_GATE_STABLE_MS": int(settings.category_gate_stable_ms or 0),
             "CATEGORY_GATE_PHASH_MIN_BITS": int(
@@ -1509,6 +1578,7 @@ def create_app() -> FastAPI:
         _opt_set_float("ROI_DIFF_ALPHA", "roi_diff_alpha")
         _opt_set_float("ROI_DIFF_THRESHOLD", "roi_diff_threshold")
         _opt_set_int("ROI_DIFF_MIN_PIXELS", "roi_diff_min_pixels")
+        _opt_set_int("ROI_DIFF_COOLDOWN_MS", "roi_diff_cooldown_ms")
         # Category defaults
         _opt_set_int("CATEGORY_GATE_STABLE_MS", "category_gate_stable_ms")
         _opt_set_int("CATEGORY_GATE_PHASH_MIN_BITS", "category_gate_phash_min_bits")
@@ -1522,7 +1592,8 @@ def create_app() -> FastAPI:
         _opt_set_float(
             "CATEGORY_PARKING_ROI_DIFF_THRESHOLD", "category_parking_roi_diff_threshold"
         )
-        # Persist to project .env
+        # Persist to project .env (best-effort)
+        warn_msg = None
         try:
             project_root = Path(__file__).resolve().parents[1]
             env_path = project_root / ".env"
@@ -1537,7 +1608,12 @@ def create_app() -> FastAPI:
                 "PHASH_STABLE_MS": str(int(settings.phash_stable_ms or 0)),
                 "ROI_DIFF_ALPHA": str(float(settings.roi_diff_alpha or 0.05)),
                 "ROI_DIFF_THRESHOLD": str(float(settings.roi_diff_threshold or 0.02)),
-                "ROI_DIFF_MIN_PIXELS": str(int(settings.roi_diff_min_pixels or 0)),
+                "ROI_DIFF_MIN_PIXELS": str(
+                    int(getattr(settings, "roi_diff_min_pixels", 0) or 0)
+                ),
+                "ROI_DIFF_COOLDOWN_MS": str(
+                    int(getattr(settings, "roi_diff_cooldown_ms", 0) or 0)
+                ),
                 "CATEGORY_GATE_STABLE_MS": str(
                     int(settings.category_gate_stable_ms or 0)
                 ),
@@ -1571,8 +1647,14 @@ def create_app() -> FastAPI:
                 out_lines.append(f"{k}={kv[k]}")
             env_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
         except Exception as e:
-            raise HTTPException(500, f"Failed to write .env: {e}")
-        return get_config()
+            warn_msg = f"Failed to write .env: {e}"
+        cfg = await get_config()
+        if warn_msg:
+            try:
+                cfg["warning"] = warn_msg
+            except Exception:
+                pass
+        return cfg
 
     # Manual retention trigger
     @app.post("/api/retention/apply", response_class=JSONResponse)
@@ -1583,6 +1665,52 @@ def create_app() -> FastAPI:
         except Exception:
             pass
         return {"ok": True, "deleted": deleted}
+
+    # LLM diagnostics and manual queueing
+    @app.get("/api/llm/status", response_class=JSONResponse)
+    async def llm_status():
+        return {
+            "enabled": bool(getattr(settings, "llm_enabled", False)),
+            "provider": getattr(settings, "llm_provider", ""),
+            "model_fast": getattr(settings, "llm_model_fast", ""),
+            "running": bool(state.llm is not None),
+        }
+
+    @app.post("/api/llm/queue_last", response_class=JSONResponse)
+    async def llm_queue_last(spot_id: str | None = None):
+        # Find the most recent spot_change event (optionally for a specific spot)
+        ev = None
+        for e in state.events.recent(500):
+            if str(e.get("kind", "")).lower() != "spot_change":
+                continue
+            if spot_id:
+                meta = e.get("meta") or {}
+                if str(meta.get("spot_id") or "") != spot_id:
+                    continue
+            ev = e
+            break
+        if not ev:
+            raise HTTPException(404, "No spot_change event found")
+        if not state.llm:
+            raise HTTPException(503, "LLM worker not running")
+        try:
+            state.llm.queue(int(ev["id"]))
+        except Exception:
+            raise HTTPException(500, "Failed to enqueue")
+        return {"ok": True, "queued_event_id": int(ev["id"])}
+
+    @app.post("/api/llm/queue_event", response_class=JSONResponse)
+    async def llm_queue_event(id: int):
+        ev = state.events.get(int(id))
+        if not ev or str(ev.get("kind", "")).lower() != "spot_change":
+            raise HTTPException(404, "spot_change event not found")
+        if not state.llm:
+            raise HTTPException(503, "LLM worker not running")
+        try:
+            state.llm.queue(int(id))
+        except Exception:
+            raise HTTPException(500, "Failed to enqueue")
+        return {"ok": True, "queued_event_id": int(id)}
 
     # Comparison baseline helpers
     @app.get("/api/compare/baseline", response_class=JSONResponse)
@@ -1610,8 +1738,15 @@ def create_app() -> FastAPI:
         return {"ok": True, "baseline_ts": state.compare_baseline_ts}
 
     @app.get("/api/spot_history", response_class=JSONResponse)
-    async def spot_history(spot_id: str, limit: int = 8):
+    async def spot_history(
+        spot_id: str, limit: int = 8, significant_only: bool = False
+    ):
         evs = state.events.spot_events(spot_id, limit)
+        if significant_only:
+            try:
+                evs = [e for e in evs if bool((e.get("meta") or {}).get("significant"))]
+            except Exception:
+                pass
         out = []
         for e in evs:
             out.append(
@@ -1622,6 +1757,9 @@ def create_app() -> FastAPI:
                     "thumb": f"/api/event_image?id={e['id']}&kind=thumb",
                     "full": f"/api/event_image?id={e['id']}&kind=full",
                     "crop": f"/api/event_image?id={e['id']}&kind=crop",
+                    "significant": bool(
+                        ((e.get("meta") or {}).get("significant")) or False
+                    ),
                 }
             )
         return {"items": out}

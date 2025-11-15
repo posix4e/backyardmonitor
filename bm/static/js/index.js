@@ -928,7 +928,12 @@ async function loadEvents() {
         const limEl = document.getElementById('events_limit');
         const lim = limEl ? parseInt(limEl.value || '50', 10) : 50;
         const j = await (await fetch(`/api/events?limit=${lim}`)).json();
-        renderEventsList(j.items || []);
+        let items = j.items || [];
+        const sigOnly = !!(document.getElementById('events_sig_only') && document.getElementById('events_sig_only').checked);
+        if (sigOnly) {
+            items = items.filter(it => String(it.kind || '').toLowerCase() === 'spot_change' && !!(it.meta && it.meta.significant));
+        }
+        renderEventsList(items);
     } catch (e) {
         console.error(e);
     }
@@ -948,18 +953,116 @@ async function editEvent(id) {
 }
 async function explainEvent(id) {
     try {
-        // Resolve spot_id from the event meta and show spot timeline
         const ev = await (await fetch(`/api/events/${encodeURIComponent(String(id))}`)).json();
-        const spotId = ev && ev.meta ? (ev.meta.spot_id || '') : '';
-        if (!spotId) {
-            alert('This event has no spot_id');
-            return;
-        }
-        const url = `/static/spot.html?spot=${encodeURIComponent(spotId)}&event=${encodeURIComponent(String(id))}`;
-        window.location.href = url;
+        const meta = ev && ev.meta ? ev.meta : {};
+        const spotId = meta.spot_id || '';
+        // Build a simple modal with LLM details (if present)
+        const wrap = document.createElement('div');
+        wrap.style.position = 'fixed';
+        wrap.style.left = '0';
+        wrap.style.top = '0';
+        wrap.style.right = '0';
+        wrap.style.bottom = '0';
+        wrap.style.background = 'rgba(0,0,0,0.35)';
+        wrap.style.zIndex = '1000';
+        const card = document.createElement('div');
+        card.style.position = 'absolute';
+        card.style.left = '50%';
+        card.style.top = '50%';
+        card.style.transform = 'translate(-50%, -50%)';
+        card.style.width = 'min(720px, 92vw)';
+        card.style.maxHeight = '80vh';
+        card.style.overflow = 'auto';
+        card.style.background = '#fff';
+        card.style.border = '1px solid #ddd';
+        card.style.borderRadius = '10px';
+        card.style.boxShadow = '0 10px 28px rgba(0,0,0,0.25)';
+        card.style.padding = '12px';
+        const mk = (k, v) => `<div style="display:flex; gap:8px;"><div style="width:180px; color:#666;">${k}</div><div style="flex:1; white-space:pre-wrap; font-family: ui-monospace, monospace;">${escapeHtml(String(v || ''))}</div></div>`;
+        const llm = {
+            status: meta.llm_status || '',
+            significant: meta.significant,
+            reason: meta.llm_reason || '',
+            provider: meta.llm_provider || '',
+            model: meta.llm_model || '',
+            prompt: meta.llm_prompt || '',
+            response: meta.llm_response || '',
+            error: meta.llm_error || '',
+        };
+        const hasLLM = !!(meta && (meta.llm_status || meta.llm_attempted));
+        const body = `
+          <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+            <div style="font-weight:600;">Event #${ev.id} · ${escapeHtml(ev.kind || '')}</div>
+            <div class="muted" style="margin-left:auto;">${new Date((ev.ts||0)*1000).toLocaleString()}</div>
+          </div>
+          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start;">
+            <div>
+              <div class="muted" style="margin-bottom:4px;">Thumb</div>
+              <img src="/api/event_image?id=${ev.id}&kind=thumb" style="max-width:260px; border:1px solid #eee; border-radius:8px;"/>
+            </div>
+            <div style="flex:1; min-width:280px;">
+              <div style="font-weight:600; margin-bottom:6px;">LLM Assessment</div>
+              ${hasLLM ? (
+                mk('Status', llm.status || '-') +
+                mk('Significant', (llm.significant != null ? String(!!llm.significant) : '-')) +
+                (llm.reason ? mk('Reason', llm.reason) : '') +
+                (llm.error ? mk('Error', llm.error) : '') +
+                (llm.provider ? mk('Provider', llm.provider) : '') +
+                (llm.model ? mk('Model', llm.model) : '') +
+                (llm.prompt ? mk('Prompt', llm.prompt) : '') +
+                (llm.response ? mk('Response', llm.response) : '')
+              ) : '<div class="muted">No LLM assessment recorded yet.</div>'}
+              <div style="margin-top:8px; display:flex; gap:8px;">
+                ${spotId ? `<a href="/static/spot.html?spot=${encodeURIComponent(spotId)}&event=${encodeURIComponent(String(ev.id))}" target="_blank">Open spot timeline ↗</a>` : ''}
+                <button id="btn_llm_queue">Analyze now</button>
+                <button id="btn_close">Close</button>
+              </div>
+            </div>
+          </div>`;
+        card.innerHTML = body;
+        wrap.appendChild(card);
+        document.body.appendChild(wrap);
+        const close = () => { try { wrap.remove(); } catch (e) {} };
+        card.querySelector('#btn_close').addEventListener('click', close);
+        card.querySelector('#btn_llm_queue').addEventListener('click', async () => {
+            try {
+                const r = await fetch(`/api/llm/queue_event?id=${encodeURIComponent(String(ev.id))}`, { method: 'POST' });
+                if (!r.ok) {
+                    alert('Queue failed');
+                    return;
+                }
+                // brief wait then refresh modal content
+                setTimeout(async () => {
+                    try {
+                        const ev2 = await (await fetch(`/api/events/${encodeURIComponent(String(id))}`)).json();
+                        const m2 = ev2 && ev2.meta ? ev2.meta : {};
+                        const upd = [];
+                        upd.push(mk('Status', m2.llm_status || '-'));
+                        upd.push(mk('Significant', (m2.significant != null ? String(!!m2.significant) : '-')));
+                        if (m2.llm_reason) upd.push(mk('Reason', m2.llm_reason));
+                        if (m2.llm_error) upd.push(mk('Error', m2.llm_error));
+                        if (m2.llm_provider) upd.push(mk('Provider', m2.llm_provider));
+                        if (m2.llm_model) upd.push(mk('Model', m2.llm_model));
+                        if (m2.llm_prompt) upd.push(mk('Prompt', m2.llm_prompt));
+                        if (m2.llm_response) upd.push(mk('Response', m2.llm_response));
+                        const sec = card.querySelectorAll('div')[1];
+                        // naive replace: rebuild the meta section
+                        const repl = document.createElement('div');
+                        repl.innerHTML = `<div style=\"font-weight:600; margin-bottom:6px;\">LLM Assessment</div>` + (upd.join('') || '<div class="muted">No LLM assessment recorded yet.</div>') +
+                                         `<div style=\"margin-top:8px; display:flex; gap:8px;\">${spotId ? `<a href=\"/static/spot.html?spot=${encodeURIComponent(spotId)}&event=${encodeURIComponent(String(ev.id))}\" target=\"_blank\">Open spot timeline ↗</a>` : ''}<button id=\"btn_llm_queue\">Analyze now</button> <button id=\"btn_close\">Close</button></div>`;
+                        card.replaceChild(repl, sec);
+                        repl.querySelector('#btn_close').addEventListener('click', close);
+                        repl.querySelector('#btn_llm_queue').addEventListener('click', async () => { /* prevent losing listener; no-op to avoid recursion */ });
+                    } catch (e) {}
+                }, 1200);
+            } catch (e) {
+                console.error(e);
+                alert('Queue failed');
+            }
+        });
     } catch (e) {
         console.error(e);
-        alert('Unable to open spot details');
+        alert('Unable to load event');
     }
 }
 async function saveEvent() {
@@ -1054,6 +1157,7 @@ async function loadPerception() {
         const rd_t = document.getElementById('roi_diff_threshold');
         const rd_a = document.getElementById('roi_diff_alpha');
         const rd_min = document.getElementById('roi_diff_min_pixels');
+        const rd_cd = document.getElementById('roi_diff_cooldown_ms');
         const dm = (j.DETECTOR_METHOD || 'phash');
         if (sel) sel.value = dm;
         if (b) b.value = j.PHASH_MIN_BITS != null ? j.PHASH_MIN_BITS : 14;
@@ -1061,6 +1165,7 @@ async function loadPerception() {
         if (rd_t) rd_t.value = j.ROI_DIFF_THRESHOLD != null ? j.ROI_DIFF_THRESHOLD : 0.02;
         if (rd_a) rd_a.value = j.ROI_DIFF_ALPHA != null ? j.ROI_DIFF_ALPHA : 0.05;
         if (rd_min) rd_min.value = j.ROI_DIFF_MIN_PIXELS != null ? j.ROI_DIFF_MIN_PIXELS : 600;
+        if (rd_cd) rd_cd.value = j.ROI_DIFF_COOLDOWN_MS != null ? j.ROI_DIFF_COOLDOWN_MS : 0;
         if (phash && rdiff) {
             const showPhash = dm === 'phash';
             phash.style.display = showPhash ? 'flex' : 'none';
@@ -1098,9 +1203,11 @@ async function savePerception() {
             const rd_t = parseFloat(document.getElementById('roi_diff_threshold').value || '0.02');
             const rd_a = parseFloat(document.getElementById('roi_diff_alpha').value || '0.05');
             const rd_min = parseInt(document.getElementById('roi_diff_min_pixels').value || '600', 10);
+            const rd_cd = parseInt(document.getElementById('roi_diff_cooldown_ms').value || '0', 10);
             payload.ROI_DIFF_THRESHOLD = rd_t;
             payload.ROI_DIFF_ALPHA = rd_a;
             payload.ROI_DIFF_MIN_PIXELS = rd_min;
+            payload.ROI_DIFF_COOLDOWN_MS = rd_cd;
         }
         const res = await fetch('/api/config', {
             method: 'POST',
@@ -1113,7 +1220,16 @@ async function savePerception() {
             alert('Save failed');
             return;
         }
-        alert('Perception settings applied');
+        try {
+            const out = await res.json();
+            if (out && out.warning) {
+                alert('Applied with note: ' + out.warning);
+            } else {
+                alert('Perception settings applied');
+            }
+        } catch (e) {
+            alert('Perception settings applied');
+        }
     } catch (e) {
         console.error(e);
     }
@@ -1163,7 +1279,8 @@ async function cleanupOrphans() {
 
 async function loadThumbnails() {
     try {
-        const j = await (await fetch('/api/thumbnails?limit=60')).json();
+        const sigOnly = !!(document.getElementById('thumb_sig_only') && document.getElementById('thumb_sig_only').checked);
+        const j = await (await fetch(`/api/thumbnails?limit=60&significant_only=${sigOnly ? '1' : '0'}`)).json();
         const grid = document.getElementById('thumb_grid');
         const fmt = (t) => new Date((t || 0) * 1000).toLocaleString();
         grid.innerHTML = (j.items || []).map((it) => {
