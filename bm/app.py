@@ -520,6 +520,11 @@ def create_app() -> FastAPI:
                                                         "ratio": ratio,
                                                         "method": "roi_diff",
                                                         "state": "enter",
+                                                        "roi_diff_threshold": float(thr_ratio),
+                                                        "roi_diff_min_pixels": int(min_pixels),
+                                                        "changed_pixels": int(changed_pixels),
+                                                        "roi_pixels": int(mask.size if mask is not None else 0),
+                                                        "stable_ms_used": int(stable_ms),
                                                     }
                                                     try:
                                                         meta["has_prev"] = bool(_has_prev_event(s.id))
@@ -623,6 +628,11 @@ def create_app() -> FastAPI:
                                                 "ratio": ratio,
                                                 "method": "roi_diff",
                                                 "state": "exit",
+                                                "roi_diff_threshold": float(thr_ratio),
+                                                "roi_diff_min_pixels": int(min_pixels),
+                                                "changed_pixels": int(changed_pixels),
+                                                "roi_pixels": int(mask.size if mask is not None else 0),
+                                                "stable_ms_used": int(stable_ms),
                                             }
                                             try:
                                                 meta["has_prev"] = bool(_has_prev_event(s.id))
@@ -804,6 +814,11 @@ def create_app() -> FastAPI:
                                                 meta["has_prev"] = bool(_has_prev_event(s.id))
                                                 if not meta["has_prev"]:
                                                     meta["significant"] = False
+                                            except Exception:
+                                                pass
+                                            try:
+                                                meta["phash_min_bits_used"] = int(min_bits)
+                                                meta["stable_ms_used"] = int(stable_ms)
                                             except Exception:
                                                 pass
                                             if (
