@@ -83,6 +83,19 @@ class VideoCaptureWorker:
                     "|fflags;nobuffer+discardcorrupt|flags;low_delay|reorder_queue_size;0|max_delay;500000"
                     "|err_detect;explode|probesize;32768|analyzeduration;0|rw_timeout;5000000|stimeout;5000000|use_wallclock_as_timestamps;1"
                 )
+                # Optional GPU HW acceleration via FFmpeg if available
+                try:
+                    hwaccel = (os.getenv("HWACCEL", "").strip().lower())
+                    hwdev = os.getenv("HWACCEL_DEVICE", "").strip()
+                    if hwaccel in {"cuda", "cuvid", "vaapi"}:
+                        if hwaccel == "cuvid":
+                            hwaccel = "cuda"
+                        opts += f"|hwaccel;{hwaccel}"
+                        if hwdev:
+                            opts += f"|hwaccel_device;{hwdev}"
+                        # Do not force output format; let OpenCV/FFmpeg download to system memory.
+                except Exception:
+                    pass
                 # Avoid clobbering unrelated options if user already set them; merge best-effort.
                 existing = os.getenv("OPENCV_FFMPEG_CAPTURE_OPTIONS")
                 if existing and existing != opts:
