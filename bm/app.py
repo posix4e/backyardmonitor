@@ -144,6 +144,28 @@ def create_app() -> FastAPI:
         build = os.getenv("GIT_SHA") or os.getenv("APP_BUILD") or ""
         return {"name": "backyardmonitor", "version": ver, "build": build}
 
+    @app.get("/api/badge", response_class=JSONResponse)
+    async def api_badge():
+        try:
+            ver = pkg_version("backyardmonitor")
+        except PackageNotFoundError:
+            ver = "0.0.0"
+        import os
+
+        build = os.getenv("GIT_SHA") or os.getenv("APP_BUILD") or ""
+        label = os.getenv("BADGE_LABEL") or "deployed"
+        color = os.getenv("BADGE_COLOR") or "blue"
+        msg = f"v{ver}"
+        if build:
+            msg = f"{msg} ({build[:7]})"
+        return {
+            "schemaVersion": 1,
+            "label": label,
+            "message": msg,
+            "color": color,
+            "cacheSeconds": int(os.getenv("BADGE_CACHE_SECONDS") or 300),
+        }
+
     @app.get("/api/spot_stats", response_class=JSONResponse)
     async def api_spot_stats():
         import numpy as np

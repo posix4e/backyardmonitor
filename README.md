@@ -1,7 +1,6 @@
 # Backyard Monitor (Rewrite)
 
-<!-- Replace YOUR_GH_USERNAME and YOUR_GIST_ID with your values -->
-![Deployed](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/YOUR_GH_USERNAME/YOUR_GIST_ID/raw/badge.json)
+![Deployed](https://img.shields.io/endpoint?url=https://monitor.newman.family/api/badge)
 
 A minimal single-process web server to:
 - Draw parking spot polygons on a live frame
@@ -80,18 +79,16 @@ Use the Data panel → Images to view summary and cleanup orphans. You can also 
 - The capture loop drops likely garbage frames (all-black/white or extremely low-variance grey) and resyncs after consecutive bad reads or idle periods. This prevents corrupt frames from propagating into event detection.
 ### Deployed version badge
 
-To display the version running on your Proxmox (LXC 101, Docker) instance exposed at `monitor.newman.family`:
+Shields.io renders a live badge from the app itself — no GitHub workflow or Gist needed.
 
-- Create a secret Gist with a file named `badge.json` and copy the Gist ID.
-- Add repository secrets:
-  - `DEPLOY_BADGE_GIST_ID` – the Gist ID
-  - `DEPLOY_BADGE_GIST_TOKEN` – a GitHub token with `gist` scope
-- The workflow `.github/workflows/deployed-badge.yml` polls `https://monitor.newman.family/api/version` every 10 minutes and updates the Gist.
-- Add this badge to the top of the README (replace placeholders):
+- The backend exposes `GET /api/badge` returning the Shields schema with your deployed version/build.
+- Place this badge in the README (domain can be changed to your deployment):
 
-  `![Deployed](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/YOUR_GH_USERNAME/YOUR_GIST_ID/raw/badge.json)`
+  `![Deployed](https://img.shields.io/endpoint?url=https://monitor.newman.family/api/badge)`
 
-Notes:
-- The backend now serves `GET /api/version` with `{ name, version, build }`.
-- Set `GIT_SHA` (or `APP_BUILD`) in your container env to include a short commit in the badge message.
-- If Cloudflare sits in front, ensure `/api/version` is reachable and not cached or blocked by WAF.
+- Configure environment in your Docker/LXC for richer info:
+  - `GIT_SHA` or `APP_BUILD`: short commit or build id (shows as `(abcdefg)`)
+  - `BADGE_LABEL` (default `deployed`), `BADGE_COLOR` (default `blue`)
+  - `BADGE_CACHE_SECONDS` (default `300`) controls Shields cache TTL
+
+Note: Through Cloudflare, make sure `/api/badge` is publicly reachable and not blocked/cached improperly.
