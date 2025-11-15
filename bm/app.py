@@ -462,6 +462,10 @@ def create_app() -> FastAPI:
                                                         state.frames_dir
                                                         / f"{base_name}_crop.jpg"
                                                     )
+                                                    mask_path = (
+                                                        state.frames_dir
+                                                        / f"{base_name}_mask.jpg"
+                                                    )
                                                     thumb_path = (
                                                         state.frames_dir
                                                         / f"{base_name}_thumb.jpg"
@@ -515,6 +519,22 @@ def create_app() -> FastAPI:
                                                                 )
                                                         except Exception:
                                                             pass
+                                                    # Save ROI mask overlay
+                                                    try:
+                                                        if mask is not None and mask.size == (crop.shape[0] * crop.shape[1]):
+                                                            overlay = crop.copy()
+                                                            if overlay.ndim == 2:
+                                                                overlay = cv2.cvtColor(overlay, cv2.COLOR_GRAY2BGR)
+                                                            m = mask > 0
+                                                            red = overlay.copy(); red[:, :] = (0, 0, 255)
+                                                            alpha = 0.35
+                                                            overlay[m] = (
+                                                                overlay[m].astype('float32') * (1.0 - alpha)
+                                                                + red[m].astype('float32') * alpha
+                                                            ).clip(0,255).astype('uint8')
+                                                            cv2.imwrite(str(mask_path), overlay, params)
+                                                    except Exception:
+                                                        pass
                                                     meta = {
                                                         "spot_id": s.id,
                                                         "ratio": ratio,
@@ -546,6 +566,11 @@ def create_app() -> FastAPI:
                                                         meta["image_crop"] = (
                                                             crop_path.name
                                                         )
+                                                    try:
+                                                        if mask_path.exists():
+                                                            meta["image_mask"] = mask_path.name
+                                                    except Exception:
+                                                        pass
                                                     if (
                                                         state.settings.store_thumbs
                                                         and thumb_path.exists()
@@ -580,6 +605,10 @@ def create_app() -> FastAPI:
                                             crop_path = (
                                                 state.frames_dir
                                                 / f"{base_name}_crop.jpg"
+                                            )
+                                            mask_path = (
+                                                state.frames_dir
+                                                / f"{base_name}_mask.jpg"
                                             )
                                             thumb_path = (
                                                 state.frames_dir
@@ -623,6 +652,22 @@ def create_app() -> FastAPI:
                                                         )
                                                 except Exception:
                                                     pass
+                                            # Save ROI mask overlay
+                                            try:
+                                                if mask is not None and mask.size == (crop.shape[0] * crop.shape[1]):
+                                                    overlay = crop.copy()
+                                                    if overlay.ndim == 2:
+                                                        overlay = cv2.cvtColor(overlay, cv2.COLOR_GRAY2BGR)
+                                                    m = mask > 0
+                                                    red = overlay.copy(); red[:, :] = (0, 0, 255)
+                                                    alpha = 0.35
+                                                    overlay[m] = (
+                                                        overlay[m].astype('float32') * (1.0 - alpha)
+                                                        + red[m].astype('float32') * alpha
+                                                    ).clip(0,255).astype('uint8')
+                                                    cv2.imwrite(str(mask_path), overlay, params)
+                                            except Exception:
+                                                pass
                                             meta = {
                                                 "spot_id": s.id,
                                                 "ratio": ratio,
@@ -650,6 +695,11 @@ def create_app() -> FastAPI:
                                                 and crop_path.exists()
                                             ):
                                                 meta["image_crop"] = crop_path.name
+                                            try:
+                                                if mask_path.exists():
+                                                    meta["image_mask"] = mask_path.name
+                                            except Exception:
+                                                pass
                                             if (
                                                 state.settings.store_thumbs
                                                 and thumb_path.exists()

@@ -41,6 +41,14 @@ async function load() {
   if (pi) pi.textContent = prev ? `#${prev.id} (${prevKind}) · ${fmtTs(prev.ts)}` : 'None';
   const ci = document.getElementById('cur_info');
   if (ci) ci.textContent = `#${ev.id} (${curKind}) · ${fmtTs(ev.ts)}`;
+  const im = document.getElementById('img_mask');
+  if (im) {
+    if (meta.image_mask) {
+      im.src = `/data/frames/${encodeURIComponent(String(meta.image_mask))}`;
+    } else {
+      im.parentElement.style.display = 'none';
+    }
+  }
   // LLM details
   const sig = !!meta.significant;
   const sigB = document.getElementById('sig_badge');
