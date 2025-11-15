@@ -136,7 +136,8 @@ class LLMWorker:
             "You are an assistant that classifies whether a changed region of a fixed camera is a meaningful change. "
             "You may be given two images: image 1 is the PREVIOUS scene and image 2 is the CURRENT scene. "
             "Identify if there is a meaningful change (e.g., new/removed person/vehicle/animal) vs trivial lighting/noise. "
-            "Return strict JSON with keys: significant (boolean) and reason (short string)."
+            "Return strict JSON with the following keys: significant (boolean), reason (short string), "
+            "and bbox (array [x1,y1,x2,y2] of normalized coordinates 0..1 in the CURRENT image). If unsure, use [0,0,0,0]."
         )
         significant = False
         reason = ""
@@ -168,6 +169,7 @@ class LLMWorker:
                 )
                 txt = (resp.choices[0].message.content or "").strip()
                 # Try to parse JSON from the response
+                meta_out_bbox = None
                 try:
                     # Allow for fenced JSON
                     if txt.startswith("```"):
@@ -177,12 +179,20 @@ class LLMWorker:
                     data = json.loads(txt)
                     significant = bool(data.get("significant", False))
                     reason = str(data.get("reason", "")).strip()
+                    bb = data.get("bbox")
+                    if (
+                        isinstance(bb, (list, tuple))
+                        and len(bb) == 4
+                        and all(isinstance(v, (int, float)) for v in bb)
+                    ):
+                        meta_out_bbox = [max(0.0, min(1.0, float(v))) for v in bb]
                 except Exception:
                     # Heuristic fallback
                     significant = ("true" in txt.lower()) and (
                         "false" not in txt.lower()
                     )
                     reason = txt[:180]
+                    meta_out_bbox = None
             elif provider == "openrouter":
                 import requests
                 api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
@@ -212,6 +222,7 @@ class LLMWorker:
                 data = r.json()
                 msg = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 txt = (msg or "").strip()
+                meta_out_bbox = None
                 try:
                     if txt.startswith("```"):
                         txt = txt.strip("` ")
@@ -220,9 +231,17 @@ class LLMWorker:
                     d = json.loads(txt)
                     significant = bool(d.get("significant", False))
                     reason = str(d.get("reason", "")).strip()
+                    bb = d.get("bbox")
+                    if (
+                        isinstance(bb, (list, tuple))
+                        and len(bb) == 4
+                        and all(isinstance(v, (int, float)) for v in bb)
+                    ):
+                        meta_out_bbox = [max(0.0, min(1.0, float(v))) for v in bb]
                 except Exception:
                     significant = ("true" in txt.lower()) and ("false" not in txt.lower())
                     reason = txt[:180]
+                    meta_out_bbox = None
         except Exception as e:
             # Leave defaults; mark failure below
             error_msg = f"{type(e).__name__}: {e}"
@@ -252,6 +271,11 @@ class LLMWorker:
                 meta_out["llm_prev_image_source"] = prev_src_key
             if error_msg:
                 meta_out["llm_error"] = error_msg
+            try:
+                if meta_out_bbox:
+                    meta_out["llm_bbox_norm"] = meta_out_bbox
+            except Exception:
+                pass
             self.events.update(int(event_id), meta=meta_out)
             try:
                 log.info(

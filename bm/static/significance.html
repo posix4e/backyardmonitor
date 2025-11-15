@@ -30,9 +30,12 @@
         <img id="img_prev" alt="previous" />
         <div class="muted" id="prev_info"></div>
       </div>
-      <div class="card imgbox">
+      <div class="card imgbox" style="position:relative;">
         <div class="muted" style="margin-bottom:6px;">Current</div>
-        <img id="img_cur" alt="current" />
+        <div id="cur_wrap" style="position:relative; display:inline-block;">
+          <img id="img_cur" alt="current" />
+          <div id="cur_box" style="position:absolute; left:0; top:0; border:2px solid #ff0055; border-radius:4px; display:none; pointer-events:none;"></div>
+        </div>
         <div class="muted" id="cur_info"></div>
       </div>
       <div class="card imgbox">

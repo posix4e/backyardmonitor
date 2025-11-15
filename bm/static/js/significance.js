@@ -71,6 +71,33 @@ async function load() {
   if (prompt) prompt.textContent = meta.llm_prompt || '';
   const response = document.getElementById('response');
   if (response) response.textContent = meta.llm_response || '';
+  // Draw LLM bbox overlay on current image
+  try {
+    const bb = meta.llm_bbox_norm;
+    if (bb && Array.isArray(bb) && bb.length === 4) {
+      const box = document.getElementById('cur_box');
+      const img = document.getElementById('img_cur');
+      const wrap = document.getElementById('cur_wrap');
+      const draw = () => {
+        const w = img.clientWidth, h = img.clientHeight;
+        if (!w || !h) return;
+        const x1 = Math.round(Math.max(0, Math.min(1, bb[0])) * w);
+        const y1 = Math.round(Math.max(0, Math.min(1, bb[1])) * h);
+        const x2 = Math.round(Math.max(0, Math.min(1, bb[2])) * w);
+        const y2 = Math.round(Math.max(0, Math.min(1, bb[3])) * h);
+        const bx = Math.min(x1, x2), by = Math.min(y1, y2);
+        const bw = Math.max(1, Math.abs(x2 - x1));
+        const bh = Math.max(1, Math.abs(y2 - y1));
+        box.style.left = bx + 'px';
+        box.style.top = by + 'px';
+        box.style.width = bw + 'px';
+        box.style.height = bh + 'px';
+        box.style.display = (bw > 1 && bh > 1) ? '' : 'none';
+      };
+      img.addEventListener('load', draw);
+      if (img.complete) draw();
+    }
+  } catch (e) {}
   // Analysis
   const an = [];
   const method = (meta.method || '').toLowerCase();
