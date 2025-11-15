@@ -1269,17 +1269,22 @@ def create_app() -> FastAPI:
     # Generic events API for read/edit/delete
     @app.get("/api/events", response_class=JSONResponse)
     async def list_events(limit: int = 100, significant_only: bool = False):
-        items = state.events.recent(int(limit))
+        lim = max(1, int(limit))
         if significant_only:
+            # Apply limit after filtering for significance; scan newest-first.
             try:
+                all_items = list(reversed(state.events.all()))
                 items = [
                     e
-                    for e in items
+                    for e in all_items
                     if str(e.get("kind", "")).lower() == "spot_change"
                     and bool((e.get("meta") or {}).get("significant"))
-                ]
+                ][:lim]
+                return {"items": items}
             except Exception:
                 pass
+        # Default: fast path using recent() limited query
+        items = state.events.recent(lim)
         return {"items": items}
 
     @app.get("/api/events/{event_id}", response_class=JSONResponse)
@@ -1476,33 +1481,46 @@ def create_app() -> FastAPI:
 
     @app.get("/api/thumbnails", response_class=JSONResponse)
     async def thumbnails(limit: int = 60, significant_only: bool = False):
-        items = []
-        for e in state.events.recent(max(0, int(limit))):
+        lim = max(1, int(limit))
+        def _to_item(e: dict) -> dict | None:
             meta = e.get("meta") or {}
-            thumb = (
-                meta.get("image_thumb")
-                or meta.get("image_crop")
-                or meta.get("image_full")
-            )
+            thumb = meta.get("image_thumb") or meta.get("image_crop") or meta.get("image_full")
             if not thumb:
-                continue
-            if significant_only:
-                try:
+                return None
+            return {
+                "event_id": e["id"],
+                "spot_id": meta.get("spot_id", ""),
+                "ts": e["ts"],
+                "thumb": f"/api/event_image?id={e['id']}&kind=thumb",
+                "full": f"/api/event_image?id={e['id']}&kind=full",
+                "significant": bool(meta.get("significant") or False),
+            }
+
+        items: list[dict] = []
+        if significant_only:
+            # Apply limit after filtering; scan newest-first over all events
+            try:
+                for e in reversed(state.events.all()):
+                    meta = e.get("meta") or {}
                     if not bool(meta.get("significant")):
                         continue
-                except Exception:
-                    continue
-            items.append(
-                {
-                    "event_id": e["id"],
-                    "spot_id": meta.get("spot_id", ""),
-                    "ts": e["ts"],
-                    "thumb": f"/api/event_image?id={e['id']}&kind=thumb",
-                    "full": f"/api/event_image?id={e['id']}&kind=full",
-                    "significant": bool(meta.get("significant") or False),
-                }
-            )
-            if len(items) >= limit:
+                    it = _to_item(e)
+                    if it is None:
+                        continue
+                    items.append(it)
+                    if len(items) >= lim:
+                        break
+                return {"items": items}
+            except Exception:
+                # fall back to recent path if needed
+                pass
+        # Default: fast path using recent() limited query
+        for e in state.events.recent(lim):
+            it = _to_item(e)
+            if it is None:
+                continue
+            items.append(it)
+            if len(items) >= lim:
                 break
         return {"items": items}
 
