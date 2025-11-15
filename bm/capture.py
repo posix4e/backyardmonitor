@@ -22,9 +22,15 @@ class CaptureState:
 
 
 class VideoCaptureWorker:
-    def __init__(self, source: str, max_fps: float | None = None):
+    def __init__(self, source: str, max_fps: float | None = None,
+                 idle_resync_ms: int = 2500,
+                 fail_resync_count: int = 10,
+                 reopen_delay_ms: int = 300):
         self.source = source
         self.max_fps = float(max_fps) if (max_fps is not None and max_fps > 0) else 0.0
+        self.idle_resync_ms = int(idle_resync_ms)
+        self.fail_resync_count = int(fail_resync_count)
+        self.reopen_delay_ms = int(reopen_delay_ms)
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -50,14 +56,23 @@ class VideoCaptureWorker:
             return self._latest
 
     def _run(self) -> None:
-        cap = cv2.VideoCapture(self.source)
-        if not cap.isOpened():
-            # attempt a delayed retry for streams that come up slowly
-            time.sleep(1.0)
-            cap = cv2.VideoCapture(self.source)
+        import logging
+
+        log = logging.getLogger("uvicorn.error")
+
+        def _open() -> cv2.VideoCapture:
+            cap_local = cv2.VideoCapture(self.source)
+            if not cap_local.isOpened():
+                time.sleep(max(0.05, self.reopen_delay_ms / 1000.0))
+                cap_local = cv2.VideoCapture(self.source)
+            return cap_local
+
+        cap = _open()
         self.state.running = cap.isOpened()
         min_period = (1.0 / self.max_fps) if self.max_fps > 0 else 0.0
         last_push = 0.0
+        last_good_ts = time.time()
+        consecutive_fail = 0
         try:
             while not self._stop.is_set() and cap.isOpened():
                 # simple fps limiter to reduce CPU burn from decoding
@@ -66,13 +81,38 @@ class VideoCaptureWorker:
                     dt = now - last_push
                     if dt < min_period:
                         time.sleep(min_period - dt)
-                
+
                 ok, frame = cap.read()
                 ts = time.time()
                 if not ok or frame is None:
+                    consecutive_fail += 1
+                    # Resync on too many consecutive failures or idle
+                    idle_ms = (ts - last_good_ts) * 1000.0
+                    if (
+                        consecutive_fail >= max(1, self.fail_resync_count)
+                        or (self.idle_resync_ms > 0 and idle_ms >= self.idle_resync_ms)
+                    ):
+                        try:
+                            log.info(
+                                f"capture resync: fails={consecutive_fail} idle_ms={idle_ms:.0f}"
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        time.sleep(max(0.05, self.reopen_delay_ms / 1000.0))
+                        cap = _open()
+                        self.state.running = cap.isOpened()
+                        consecutive_fail = 0
+                        # Continue loop to try next read
+                        continue
                     time.sleep(0.05)
                     continue
                 last_push = ts
+                last_good_ts = ts
+                consecutive_fail = 0
                 h, w = frame.shape[:2]
                 self.state.width, self.state.height = w, h
                 self.state.last_ts = ts

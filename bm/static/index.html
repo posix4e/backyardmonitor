@@ -521,8 +521,11 @@
       async function draw() {
         // draw latest frame
         const img = new Image();
+        let retries = 0;
         img.onload = () => {
-          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          try {
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          } catch(e) {}
           // overlay spots as rectangles
           if (spots && spots.length) {
             ctx.strokeStyle = '#44aaff'; ctx.lineWidth = 2; ctx.fillStyle = 'rgba(68,170,255,0.12)';
@@ -556,6 +559,13 @@
             }
           }
           fillSpotEditor();
+        };
+        img.onerror = () => {
+          // quick retry once to reduce visible grey on transient errors
+          if (retries < 1) {
+            retries++;
+            setTimeout(() => { img.src = '/frame.jpg?ts=' + Date.now(); }, 200);
+          }
         };
         img.src = '/frame.jpg?ts=' + Date.now();
       }
@@ -625,7 +635,7 @@
 
       // Slow down frame refresh to reduce flicker while editing
       if (window.__bm_drawInt) { try { clearInterval(window.__bm_drawInt); } catch (e) {} }
-      window.__bm_drawInt = setInterval(() => { draw(); }, 2500);
+      window.__bm_drawInt = setInterval(() => { draw(); }, 1000);
       // Track last phash per spot for change detection
       let lastSigMap = {};
       // Cache previous image URL per spot from aggregated API

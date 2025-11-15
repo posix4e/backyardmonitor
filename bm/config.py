@@ -18,6 +18,10 @@ class Settings:
     # Performance
     capture_max_fps: float = 5.0
     frame_jpeg_fps: float = 2.0
+    # Auto-resync behavior for RTSP/capture
+    capture_idle_resync_ms: int = 2500
+    capture_fail_resync_count: int = 10
+    capture_reopen_delay_ms: int = 300
     # Storage/retention
     store_full_frames: bool = False
     store_crops: bool = False
@@ -100,6 +104,19 @@ class Settings:
             frame_jpeg_fps = float(os.getenv("FRAME_JPEG_FPS", "2"))
         except Exception:
             frame_jpeg_fps = 2.0
+        # Auto-resync knobs
+        try:
+            capture_idle_resync_ms = max(0, int(os.getenv("CAPTURE_IDLE_RESYNC_MS", "2500")))
+        except Exception:
+            capture_idle_resync_ms = 2500
+        try:
+            capture_fail_resync_count = max(1, int(os.getenv("CAPTURE_FAIL_RESYNC_COUNT", "10")))
+        except Exception:
+            capture_fail_resync_count = 10
+        try:
+            capture_reopen_delay_ms = max(0, int(os.getenv("CAPTURE_REOPEN_DELAY_MS", "300")))
+        except Exception:
+            capture_reopen_delay_ms = 300
 
         return cls(
             rtsp_url=rtsp_url,
@@ -118,4 +135,7 @@ class Settings:
             max_storage_gb=max_storage_gb,
             capture_max_fps=capture_max_fps,
             frame_jpeg_fps=frame_jpeg_fps,
+            capture_idle_resync_ms=capture_idle_resync_ms,
+            capture_fail_resync_count=capture_fail_resync_count,
+            capture_reopen_delay_ms=capture_reopen_delay_ms,
         )

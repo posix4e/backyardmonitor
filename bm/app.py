@@ -38,16 +38,35 @@ class AppState:
         # Cached JPEG to avoid re-encoding every request
         self._last_jpg: bytes | None = None
         self._last_jpg_ts: float = 0.0
+        # Heuristic tracking for low-variance (grey) frames
+        self._lowvar_count: int = 0
+        self._last_restart_ts: float = 0.0
 
     def ensure_capture(self) -> None:
         if not self.settings.rtsp_url:
             return
         if self.capture is None:
             self.capture = VideoCaptureWorker(
-                self.settings.rtsp_url, max_fps=self.settings.capture_max_fps
+                self.settings.rtsp_url,
+                max_fps=self.settings.capture_max_fps,
+                idle_resync_ms=self.settings.capture_idle_resync_ms,
+                fail_resync_count=self.settings.capture_fail_resync_count,
+                reopen_delay_ms=self.settings.capture_reopen_delay_ms,
             )
         # start only if not running
         self.capture.start()
+
+    def restart_capture(self) -> None:
+        try:
+            if self.capture:
+                self.capture.stop()
+        except Exception:
+            pass
+        try:
+            self.capture = None
+        except Exception:
+            pass
+        self.ensure_capture()
 
 
 def create_app() -> FastAPI:
@@ -662,7 +681,26 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "No capture running")
         latest = state.capture.latest()
         if not latest:
-            raise HTTPException(404, "No frame available")
+            # Briefly wait for a fresh frame to avoid transient grey
+            try:
+                import asyncio
+
+                for _ in range(3):
+                    await asyncio.sleep(0.08)
+                    latest = state.capture.latest()
+                    if latest:
+                        break
+            except Exception:
+                pass
+            if not latest:
+                # Serve last encoded JPEG if available to avoid flicker/grey
+                if state._last_jpg is not None:
+                    return Response(
+                        content=state._last_jpg,
+                        media_type="image/jpeg",
+                        headers={"Cache-Control": "no-store"},
+                    )
+                raise HTTPException(404, "No frame available")
         frame, _ts = latest
         # Encode JPEG at a limited rate and cache it to reduce CPU
         try:
@@ -675,13 +713,55 @@ def create_app() -> FastAPI:
             if (now - state._last_jpg_ts) < min_period:
                 use_cache = True
         if use_cache and state._last_jpg is not None:
-            return Response(content=state._last_jpg, media_type="image/jpeg")
-        jpg = state.capture.encode_jpeg(
-            frame, quality=int(state.settings.jpeg_quality or 80)
-        )
+            return Response(
+                content=state._last_jpg,
+                media_type="image/jpeg",
+                headers={"Cache-Control": "no-store"},
+            )
+        # Heuristic: detect likely grey/corrupt frames (low variance)
+        try:
+            import cv2
+            import numpy as np
+
+            small = cv2.resize(frame, (64, 36), interpolation=cv2.INTER_AREA)
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            std = float(np.std(gray))
+            if std < 2.0:  # very low detail; likely grey/corrupt
+                state._lowvar_count += 1
+                # If we have a cached good JPEG, serve it instead of updating
+                if state._last_jpg is not None:
+                    # Optionally trigger a capture restart if repeated
+                    if state._lowvar_count >= 5 and (now - state._last_restart_ts) > 5.0:
+                        try:
+                            state.restart_capture()
+                            state._last_restart_ts = now
+                        except Exception:
+                            pass
+                    return Response(
+                        content=state._last_jpg,
+                        media_type="image/jpeg",
+                        headers={"Cache-Control": "no-store"},
+                    )
+            else:
+                state._lowvar_count = 0
+        except Exception:
+            pass
+        try:
+            jpg = state.capture.encode_jpeg(
+                frame, quality=int(state.settings.jpeg_quality or 80)
+            )
+        except Exception:
+            # Fallback to last cached JPG on encoding error
+            if state._last_jpg is not None:
+                return Response(
+                    content=state._last_jpg,
+                    media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store"},
+                )
+            raise
         state._last_jpg = jpg
         state._last_jpg_ts = now
-        return Response(content=jpg, media_type="image/jpeg")
+        return Response(content=jpg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
     # Removed grid cell preview endpoint for a simpler calibration UX
     # gate endpoint removed
