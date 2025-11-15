@@ -426,6 +426,36 @@ def create_app() -> FastAPI:
         data = path.read_bytes()
         return Response(content=data, media_type="image/jpeg")
 
+    # Events bulk clear (place before parameterized routes to avoid 422 conflicts)
+    @app.post("/api/events/clear", response_class=JSONResponse)
+    async def clear_events_compat():
+        return await clear_events_impl()
+
+    @app.post("/api/events/clear_all", response_class=JSONResponse)
+    async def clear_events_api():
+        return await clear_events_impl()
+
+    async def clear_events_impl():
+        # Remove all referenced images first, then clear DB
+        try:
+            ref = state.events.referenced_images()
+            for name in list(ref):
+                p = state.frames_dir / str(name)
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        deleted = state.events.clear()
+        # Also reset compare baseline so helper endpoints ignore older cache
+        try:
+            state.compare_baseline_ts = time.time()
+        except Exception:
+            pass
+        return {"ok": True, "deleted": int(deleted)}
+
     # Generic events API for read/edit/delete
     @app.get("/api/events", response_class=JSONResponse)
     async def list_events(limit: int = 100):
