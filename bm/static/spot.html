@@ -29,6 +29,10 @@
       <a href="/" title="Back">⬅ Back</a>
       <div>Spot <span id="spot_id" class="sp"></span> · Timeline</div>
       <div class="nav">
+        <label class="muted">Name <input id="spot_name" type="text" placeholder="Spot name" style="width:180px;"/></label>
+        <label class="muted">Min bits <input id="spot_min_bits" type="number" style="width:90px;"/></label>
+        <label class="muted">Stable ms <input id="spot_stable_ms" type="number" style="width:110px;"/></label>
+        <button id="save_cfg_btn" title="Save spot settings">Save</button>
         <label>Limit <input id="limit" type="number" value="60" min="1" style="width:80px;"/></label>
         <button id="reload_btn">Load</button>
       </div>
@@ -71,6 +75,7 @@
         }
         document.getElementById('spot_id').textContent = spotId || '-';
         if (!spotId){ alert('Missing spot (could not derive from event)'); return; }
+        try { await loadSpotConfig(spotId); } catch(e){}
         await loadExplain(eventId); // optional, shows context if event provided
 
         // Load spot history (newest first)
@@ -97,6 +102,49 @@
         }
         grid.innerHTML = '<div class="muted">Loading timeline…</div>';
         await renderTimeline(spotId, items, eventId);
+      }
+
+      async function loadSpotConfig(spotId){
+        try {
+          const z = await (await fetch('/api/zones')).json();
+          const sp = (z.spots||[]).find(s => String(s.id) === String(spotId));
+          const nameEl = document.getElementById('spot_name');
+          if (nameEl) nameEl.value = (sp && sp.name) ? sp.name : '';
+          const minEl = document.getElementById('spot_min_bits');
+          const stEl = document.getElementById('spot_stable_ms');
+          if (minEl) minEl.value = (sp && sp.min_bits != null) ? sp.min_bits : '';
+          if (stEl) stEl.value = (sp && sp.stable_ms != null) ? sp.stable_ms : '';
+        } catch(e) { /* ignore */ }
+      }
+
+      async function saveSpotConfig(){
+        const spotId = document.getElementById('spot_id').textContent || '';
+        const nameEl = document.getElementById('spot_name');
+        const newName = nameEl ? String(nameEl.value||'').trim() : '';
+        const minEl = document.getElementById('spot_min_bits');
+        const stEl = document.getElementById('spot_stable_ms');
+        const minBits = (minEl && String(minEl.value).trim() !== '') ? parseInt(minEl.value, 10) : null;
+        const stableMs = (stEl && String(stEl.value).trim() !== '') ? parseInt(stEl.value, 10) : null;
+        if (!spotId){ alert('Missing spot id'); return; }
+        try {
+          const zones = await (await fetch('/api/zones')).json();
+          let updated = false;
+          const spots = Array.isArray(zones.spots) ? zones.spots.map(s => {
+            if (String(s.id) === String(spotId)) {
+              updated = true;
+              const next = { ...s, name: newName || s.id };
+              if (minBits !== null && !Number.isNaN(minBits)) next.min_bits = minBits; else delete next.min_bits;
+              if (stableMs !== null && !Number.isNaN(stableMs)) next.stable_ms = stableMs; else delete next.stable_ms;
+              return next;
+            }
+            return s;
+          }) : [];
+          if (!updated){ alert('Spot not found in zones'); return; }
+          const payload = { gate: zones.gate || null, spots };
+          const res = await fetch('/api/zones', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+          if (!res.ok){ alert('Save failed'); return; }
+          alert('Settings saved');
+        } catch(e){ console.error(e); alert('Failed to save name'); }
       }
 
       async function renderTimeline(spotId, items, eventId){
@@ -160,6 +208,8 @@
 
       const reloadBtn = document.getElementById('reload_btn');
       if (reloadBtn){ reloadBtn.addEventListener('click', load); }
+      const saveCfgBtn = document.getElementById('save_cfg_btn');
+      if (saveCfgBtn){ saveCfgBtn.addEventListener('click', saveSpotConfig); }
 
       load();
     </script>

@@ -65,16 +65,11 @@
           </div>
           <div id="spot_list" class="list"></div>
           <div id="spot_editor" style="margin-top:8px; display:none;">
-            <div style="margin-bottom:6px;">Edit Spot <span id="spot_edit_id" class="muted"></span></div>
-            <label for="spot_name">Name</label>
-            <input id="spot_name" type="text" style="width: 260px;" oninput="onSpotNameInput()"/>
+            <div style="margin-bottom:6px;">Selected Spot <span id="spot_edit_id" class="muted"></span></div>
             <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:6px;">
-              <label>Min bits <input id="spot_min_bits" type="number" style="width:80px;"></label>
-              <label>Stable ms <input id="spot_stable_ms" type="number" style="width:100px;"></label>
               <span id="spot_size" class="muted" style="font-size:12px;"></span>
             </div>
             <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;">
-              <button onclick="saveSpotSettings()">Save Spot</button>
               <button onclick="openSpotDetails()">Open Details</button>
             </div>
           </div>
@@ -151,9 +146,7 @@
       const spotListEl = document.getElementById('spot_list');
       const spotEditor = document.getElementById('spot_editor');
       const spotEditIdEl = document.getElementById('spot_edit_id');
-      const spotNameInput = document.getElementById('spot_name');
-      const spotMinBitsInput = document.getElementById('spot_min_bits');
-      const spotStableMsInput = document.getElementById('spot_stable_ms');
+      // Spot editing for name/min/stable moved to spot detail page
       const spotSizeEl = document.getElementById('spot_size');
       let baseW = 0, baseH = 0; // native frame size from backend
       const initW = canvas.width, initH = canvas.height; // initial canvas size (shrink target)
@@ -331,11 +324,7 @@
         draw();
       }
 
-      function updateSpotName(name){
-        if (!selectedSpotId) return;
-        const s = spots.find(sp => sp.id === selectedSpotId);
-        if (s) { s.name = (name || '').trim() || s.id; renderSpotList(); fillSpotEditor(); draw(); }
-      }
+      // Name editing removed from main page; handled on spot detail
 
       function selectedBBox(){
         const s = spots.find(sp => sp.id === selectedSpotId);
@@ -370,34 +359,8 @@
         if (!s){ spotEditor.style.display = 'none'; return; }
         spotEditor.style.display = 'block';
         if (spotEditIdEl) spotEditIdEl.textContent = s.id;
-        if (spotNameInput) spotNameInput.value = s.name || s.id;
         const box = selectedBBox();
         if (spotSizeEl) spotSizeEl.textContent = box ? `${Math.round(box.w)}×${Math.round(box.h)} px` : '';
-        (async () => {
-          try {
-            const z = await (await fetch('/api/zones')).json();
-            const cfg = (z.spots||[]).find(sp=>sp.id===selectedSpotId) || {};
-            if (spotMinBitsInput) spotMinBitsInput.value = cfg.min_bits != null ? cfg.min_bits : '';
-            if (spotStableMsInput) spotStableMsInput.value = cfg.stable_ms != null ? cfg.stable_ms : '';
-          } catch(e) {}
-        })();
-      }
-
-      function onSpotNameInput(){ updateSpotName(spotNameInput ? spotNameInput.value : ''); }
-
-      async function saveSpotSettings(){
-        if (!selectedSpotId) return;
-        try {
-          const newName = spotNameInput ? (spotNameInput.value||'') : '';
-          const minBits = spotMinBitsInput && spotMinBitsInput.value !== '' ? parseInt(spotMinBitsInput.value,10) : null;
-          const stableMs = spotStableMsInput && spotStableMsInput.value !== '' ? parseInt(spotStableMsInput.value,10) : null;
-          const z = await (await fetch('/api/zones')).json();
-          const spotsZ = z.spots || [];
-          for (const sp of spotsZ){ if (sp.id === selectedSpotId){ sp.name = newName || sp.id; if (minBits!==null) sp.min_bits = minBits; else delete sp.min_bits; if (stableMs!==null) sp.stable_ms = stableMs; else delete sp.stable_ms; break; } }
-          await fetch('/api/zones', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ spots: spotsZ }) });
-          for (let i=0;i<spots.length;i++){ if (spots[i].id === selectedSpotId){ spots[i].name = newName || spots[i].id; break; } }
-          renderSpotList();
-        } catch(e) { console.error(e); }
       }
 
       function openSpotDetails(){
