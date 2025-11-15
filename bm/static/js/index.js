@@ -1053,12 +1053,14 @@ async function loadPerception() {
         const m = document.getElementById('phash_ms');
         const rd_t = document.getElementById('roi_diff_threshold');
         const rd_a = document.getElementById('roi_diff_alpha');
+        const rd_min = document.getElementById('roi_diff_min_pixels');
         const dm = (j.DETECTOR_METHOD || 'phash');
         if (sel) sel.value = dm;
         if (b) b.value = j.PHASH_MIN_BITS != null ? j.PHASH_MIN_BITS : 14;
         if (m) m.value = j.PHASH_STABLE_MS != null ? j.PHASH_STABLE_MS : 1200;
         if (rd_t) rd_t.value = j.ROI_DIFF_THRESHOLD != null ? j.ROI_DIFF_THRESHOLD : 0.02;
         if (rd_a) rd_a.value = j.ROI_DIFF_ALPHA != null ? j.ROI_DIFF_ALPHA : 0.05;
+        if (rd_min) rd_min.value = j.ROI_DIFF_MIN_PIXELS != null ? j.ROI_DIFF_MIN_PIXELS : 600;
         if (phash && rdiff) {
             const showPhash = dm === 'phash';
             phash.style.display = showPhash ? 'flex' : 'none';
@@ -1095,8 +1097,10 @@ async function savePerception() {
         } else {
             const rd_t = parseFloat(document.getElementById('roi_diff_threshold').value || '0.02');
             const rd_a = parseFloat(document.getElementById('roi_diff_alpha').value || '0.05');
+            const rd_min = parseInt(document.getElementById('roi_diff_min_pixels').value || '600', 10);
             payload.ROI_DIFF_THRESHOLD = rd_t;
             payload.ROI_DIFF_ALPHA = rd_a;
+            payload.ROI_DIFF_MIN_PIXELS = rd_min;
         }
         const res = await fetch('/api/config', {
             method: 'POST',

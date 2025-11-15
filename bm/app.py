@@ -1457,6 +1457,7 @@ def create_app() -> FastAPI:
             "PHASH_STABLE_MS": int(settings.phash_stable_ms or 0),
             "ROI_DIFF_ALPHA": float(settings.roi_diff_alpha or 0.05),
             "ROI_DIFF_THRESHOLD": float(settings.roi_diff_threshold or 0.02),
+            "ROI_DIFF_MIN_PIXELS": int(settings.roi_diff_min_pixels or 0),
             # category defaults
             "CATEGORY_GATE_STABLE_MS": int(settings.category_gate_stable_ms or 0),
             "CATEGORY_GATE_PHASH_MIN_BITS": int(
@@ -1507,6 +1508,7 @@ def create_app() -> FastAPI:
         _opt_set_int("PHASH_STABLE_MS", "phash_stable_ms")
         _opt_set_float("ROI_DIFF_ALPHA", "roi_diff_alpha")
         _opt_set_float("ROI_DIFF_THRESHOLD", "roi_diff_threshold")
+        _opt_set_int("ROI_DIFF_MIN_PIXELS", "roi_diff_min_pixels")
         # Category defaults
         _opt_set_int("CATEGORY_GATE_STABLE_MS", "category_gate_stable_ms")
         _opt_set_int("CATEGORY_GATE_PHASH_MIN_BITS", "category_gate_phash_min_bits")
@@ -1535,6 +1537,7 @@ def create_app() -> FastAPI:
                 "PHASH_STABLE_MS": str(int(settings.phash_stable_ms or 0)),
                 "ROI_DIFF_ALPHA": str(float(settings.roi_diff_alpha or 0.05)),
                 "ROI_DIFF_THRESHOLD": str(float(settings.roi_diff_threshold or 0.02)),
+                "ROI_DIFF_MIN_PIXELS": str(int(settings.roi_diff_min_pixels or 0)),
                 "CATEGORY_GATE_STABLE_MS": str(
                     int(settings.category_gate_stable_ms or 0)
                 ),
