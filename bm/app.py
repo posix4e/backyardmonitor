@@ -225,6 +225,48 @@ def create_app() -> FastAPI:
                             except Exception:
                                 pass
                         if stable and delta_bits >= min_bits:
+                            # Before accepting, reject low-variance (grey/blank) crops to avoid false events
+                            try:
+                                import numpy as _np
+                                import cv2 as _cv2
+
+                                def _is_low_detail(img) -> bool:
+                                    if img is None:
+                                        return True
+                                    if img.size == 0:
+                                        return True
+                                    g = _cv2.cvtColor(img, _cv2.COLOR_BGR2GRAY)
+                                    small = _cv2.resize(g, (64, 36), interpolation=_cv2.INTER_AREA)
+                                    mean = float(_np.mean(small))
+                                    std = float(_np.std(small))
+                                    # Stricter than capture-level: weed out bland crops
+                                    if mean < 6.0 or mean > 245.0:
+                                        return True
+                                    if std < 6.0:
+                                        return True
+                                    zeros = float((small <= 2).sum())
+                                    highs = float((small >= 253).sum())
+                                    total = float(small.size) if small.size else 1.0
+                                    if (zeros / total) > 0.98 or (highs / total) > 0.98:
+                                        return True
+                                    return False
+
+                                lowvar = False
+                                if "crop" in locals() and crop is not None and crop.size > 0:
+                                    lowvar = _is_low_detail(crop)
+                                else:
+                                    lowvar = _is_low_detail(frame)
+                            except Exception:
+                                lowvar = False
+                            if lowvar:
+                                try:
+                                    logging.getLogger("uvicorn.error").info(
+                                        f"spot={s.id} status=reject_lowvar delta={delta_bits}"
+                                    )
+                                except Exception:
+                                    pass
+                                # Do not accept or update signature; keep candidate to re-evaluate later
+                                continue
                             duration_prev = max(0.0, now - prev_since)
                             try:
                                 import cv2, os

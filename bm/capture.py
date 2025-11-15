@@ -76,10 +76,12 @@ class VideoCaptureWorker:
                 # - small probesize/analyzeduration to start decoding fast
                 # - rw_timeout/stimeout socket timeouts
                 # - use_wallclock_as_timestamps=1 to progress timestamps
+                # Prefer strict error handling: discard corrupt packets and explode on decoder errors
+                # so we get a read() failure rather than low-detail/grey frames.
                 opts = (
                     f"rtsp_transport;{rtsp_transport}"
-                    "|fflags;nobuffer|flags;low_delay|reorder_queue_size;0|max_delay;500000"
-                    "|probesize;32768|analyzeduration;0|rw_timeout;5000000|stimeout;5000000|use_wallclock_as_timestamps;1"
+                    "|fflags;nobuffer+discardcorrupt|flags;low_delay|reorder_queue_size;0|max_delay;500000"
+                    "|err_detect;explode|probesize;32768|analyzeduration;0|rw_timeout;5000000|stimeout;5000000|use_wallclock_as_timestamps;1"
                 )
                 # Avoid clobbering unrelated options if user already set them; merge best-effort.
                 existing = os.getenv("OPENCV_FFMPEG_CAPTURE_OPTIONS")
