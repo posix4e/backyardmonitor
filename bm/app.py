@@ -740,34 +740,7 @@ def create_app() -> FastAPI:
                 media_type="image/jpeg",
                 headers={"Cache-Control": "no-store"},
             )
-        # Heuristic: detect likely grey/corrupt frames (low variance)
-        try:
-            import cv2
-            import numpy as np
-
-            small = cv2.resize(frame, (64, 36), interpolation=cv2.INTER_AREA)
-            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-            std = float(np.std(gray))
-            if std < 2.0:  # very low detail; likely grey/corrupt
-                state._lowvar_count += 1
-                # If we have a cached good JPEG, serve it instead of updating
-                if state._last_jpg is not None:
-                    # Optionally trigger a capture restart if repeated
-                    if state._lowvar_count >= 5 and (now - state._last_restart_ts) > 5.0:
-                        try:
-                            state.restart_capture()
-                            state._last_restart_ts = now
-                        except Exception:
-                            pass
-                    return Response(
-                        content=state._last_jpg,
-                        media_type="image/jpeg",
-                        headers={"Cache-Control": "no-store"},
-                    )
-            else:
-                state._lowvar_count = 0
-        except Exception:
-            pass
+        # No grey-frame heuristic here; rely on capture-level resync and warmup.
         try:
             jpg = state.capture.encode_jpeg(
                 frame, quality=int(state.settings.jpeg_quality or 80)

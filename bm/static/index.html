@@ -96,7 +96,7 @@
             <input type="number" id="events_limit" name="events_limit" value="50" min="1" style="width:70px;"/>
             <button style="margin-left:auto; color:#a00;" onclick="clearAllEvents()">Clear Events</button>
           </div>
-          <div id="events_list" style="max-height:180px; overflow:auto; border:1px solid #eee; padding:6px; border-radius:6px;"></div>
+          <div id="events_list" style="max-height:220px; overflow:auto; border:1px solid #eee; padding:6px; border-radius:6px;"></div>
           <div id="event_editor" style="margin-top:8px; display:none;">
             <div style="margin-bottom:4px;">Editing Event <span id="ev_id"></span></div>
             <label for="ev_kind">Kind</label>
@@ -789,16 +789,25 @@
           const hasSpot = !!(it && it.meta && it.meta.spot_id);
           const isSpotChange = String(it && it.kind || '').toLowerCase() === 'spot_change';
           const showWhy = hasSpot && isSpotChange;
-          return `<div style=\"display:flex; align-items:center; gap:8px; padding:4px 0; border-bottom:1px solid #f2f2f2;\">`
+          return `<div style=\"display:flex; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid #f2f2f2;\">`
             + `<span style=\"width:56px;\">#${it.id}</span>`
             + `<span style=\"flex:1;\">${safe(it.kind)}</span>`
             + `<span class=\"muted\" style=\"flex:1;\">${safe(ts)}</span>`
             + (showWhy ? `<button data-eid=\"${it.id}\" class=\"ev_why\">Why?</button>` : '')
             + `<button data-eid=\"${it.id}\" class=\"ev_edit\">Edit</button>`
+            + `<button data-eid=\"${it.id}\" class=\"ev_delete\" style=\"color:#b00000;\">Delete</button>`
             + `</div>`
         }).join('');
         el.querySelectorAll('.ev_edit').forEach(btn => { btn.addEventListener('click', () => editEvent(btn.getAttribute('data-eid'))); });
         el.querySelectorAll('.ev_why').forEach(btn => { btn.addEventListener('click', () => explainEvent(btn.getAttribute('data-eid'))); });
+        el.querySelectorAll('.ev_delete').forEach(btn => { btn.addEventListener('click', async () => {
+          const id = btn.getAttribute('data-eid');
+          if (!confirm(`Delete event #${id}?`)) return;
+          try { await fetch(`/api/events/${id}`, { method:'DELETE' }); } catch(e) { console.error(e); alert('Delete failed'); return; }
+          await loadEvents();
+          try { await loadImagesSummary(); } catch(e){}
+          try { await loadThumbnails(); } catch(e){}
+        }); });
       }
       async function loadEvents(){
         try {
@@ -914,10 +923,22 @@ async function loadPerception(){
           const grid = document.getElementById('thumb_grid');
           const fmt = (t)=> new Date((t||0)*1000).toLocaleString();
           grid.innerHTML = (j.items||[]).map((it)=>{
-            return `<a href="${it.full}" target="_blank" title="#${it.event_id} - ${fmt(it.ts)}">`
-                + `<img src="${it.thumb}" style="max-width:140px; border-radius:6px; border:1px solid #eee;"/>`
-                + `</a>`;
+            return `<div style="position:relative; display:inline-block;">`
+              + `<a href="${it.full}" target="_blank" title="#${it.event_id} - ${fmt(it.ts)}">`
+              + `<img src="${it.thumb}" style="max-width:140px; border-radius:6px; border:1px solid #eee;"/>`
+              + `</a>`
+              + `<button class="thumb_delete" data-eid="${it.event_id}" title="Delete" style="position:absolute; right:4px; top:4px; background:#fff; border:1px solid #ccc; border-radius:10px; width:22px; height:22px; line-height:1; color:#b00000; cursor:pointer;">×</button>`
+              + `</div>`;
           }).join('');
+          grid.querySelectorAll('.thumb_delete').forEach(btn => { btn.addEventListener('click', async (e) => {
+            e.preventDefault(); e.stopPropagation();
+            const id = btn.getAttribute('data-eid');
+            if (!confirm(`Delete event #${id} and its images?`)) return;
+            try { await fetch(`/api/events/${id}`, { method:'DELETE' }); } catch(err){ console.error(err); alert('Delete failed'); return; }
+            await loadThumbnails();
+            try { await loadEvents(); } catch(err){}
+            try { await loadImagesSummary(); } catch(err){}
+          }); });
         } catch(e){ console.error(e); }
       }
 refresh();

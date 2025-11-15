@@ -119,20 +119,35 @@ class VideoCaptureWorker:
                     small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
                 mean = float(np.mean(small))
                 std = float(np.std(small))
-                if mean < 2.0 or mean > 253.0:
+                # Reject nearly all-dark or all-bright frames
+                if mean < 3.0 or mean > 252.0:
                     return False
-                if std < 2.0:  # extremely low detail; likely grey/garbage
+                # Reject extremely low-detail frames
+                if std < 3.5:
+                    return False
+                # If almost all pixels are at extreme ends, reject
+                # Compute simple saturation ratio using thresholds
+                zeros = float((small <= 1).sum())
+                highs = float((small >= 254).sum())
+                total = float(small.size)
+                if total > 0 and ((zeros / total) > 0.98 or (highs / total) > 0.98):
                     return False
                 return True
             except Exception:
                 return False
 
         cap = _open()
+        try:
+            # Keep buffer small to reduce latency/grey frames after stalls (best-effort).
+            cap.set(getattr(cv2, "CAP_PROP_BUFFERSIZE", 38), 2)
+        except Exception:
+            pass
         self.state.running = cap.isOpened()
         min_period = (1.0 / self.max_fps) if self.max_fps > 0 else 0.0
         last_push = 0.0
         last_good_ts = time.time()
         consecutive_fail = 0
+        warmup_valid_needed = 3  # discard a few early frames after (re)open
         try:
             while not self._stop.is_set() and cap.isOpened():
                 # simple fps limiter to reduce CPU burn from decoding
@@ -164,8 +179,13 @@ class VideoCaptureWorker:
                             pass
                         time.sleep(max(0.05, self.reopen_delay_ms / 1000.0))
                         cap = _open()
+                        try:
+                            cap.set(getattr(cv2, "CAP_PROP_BUFFERSIZE", 38), 2)
+                        except Exception:
+                            pass
                         self.state.running = cap.isOpened()
                         consecutive_fail = 0
+                        warmup_valid_needed = 3
                         # Continue loop to try next read
                         continue
                     time.sleep(0.05)
@@ -173,6 +193,10 @@ class VideoCaptureWorker:
                 last_push = ts
                 last_good_ts = ts
                 consecutive_fail = 0
+                if warmup_valid_needed > 0:
+                    # Skip publishing first few valid frames after (re)open; often grey/blank
+                    warmup_valid_needed -= 1
+                    continue
                 h, w = frame.shape[:2]
                 self.state.width, self.state.height = w, h
                 self.state.last_ts = ts
