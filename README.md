@@ -28,6 +28,11 @@ No separate CLI is needed; everything runs behind the webserver.
   - Or: `uvicorn bm.app:app --reload --port 8080 --env-file .env`
  - Open http://localhost:8080 — one page for live view, spot calibration, and a generic JSON editor for zones, events, and image management.
 
+### UI refresh interval
+
+- The live frame on the home page refreshes every 10s by default to reduce load.
+- Configure via env/API: `UI_FRAME_REFRESH_MS` (e.g., set to 5000 for 5s) — returned by `/api/config`.
+
 ## Deployment
 
 Recommended: uv + systemd (no Docker). See `DEPLOY.md` for the unit file and a one‑command `deploy.sh`.

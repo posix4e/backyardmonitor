@@ -16,6 +16,12 @@ const spotEditIdEl = document.getElementById('spot_edit_id');
 const spotSizeEl = document.getElementById('spot_size');
 let baseW = 0,
     baseH = 0; // native frame size from backend
+// View transform (pan/zoom) over native coordinates
+let viewZoom = 1.0; // 1.0 = full frame fits canvas
+let viewX = 0.0, viewY = 0.0; // top-left of viewport in native coords
+let isPanning = false;
+let panStart = null; // {sx, sy, vx, vy}
+let spaceDown = false;
 const initW = canvas.width,
     initH = canvas.height; // initial canvas size (shrink target)
 let expanded = false; // false => 640x360, true => full native size
@@ -28,25 +34,38 @@ let dragStart = null; // {x,y} in native coords
 let dragStartPoly = null; // deep copy of polygon at start
 let downOnEmpty = false; // distinguish tap-to-add
 
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+function viewportNative() {
+    // compute native viewport for current zoom and clamp within frame
+    if (!baseW || !baseH) return { sx: 0, sy: 0, vw: 0, vh: 0 };
+    const vw = baseW / Math.max(0.01, viewZoom);
+    const vh = baseH / Math.max(0.01, viewZoom);
+    const sx = clamp(viewX, 0, Math.max(0, baseW - vw));
+    const sy = clamp(viewY, 0, Math.max(0, baseH - vh));
+    return { sx, sy, vw, vh };
+}
+
 function screenToNative(clientX, clientY) {
     const rect = canvas.getBoundingClientRect();
-    const sx = baseW ? (baseW / canvas.width) : 1;
-    const sy = baseH ? (baseH / canvas.height) : 1;
-    const x = Math.round((clientX - rect.left) * sx);
-    const y = Math.round((clientY - rect.top) * sy);
+    const vp = viewportNative();
+    if (!vp.vw || !vp.vh) return { x: 0, y: 0 };
+    const px = clientX - rect.left;
+    const py = clientY - rect.top;
+    const x = vp.sx + (px / Math.max(1, canvas.width)) * vp.vw;
+    const y = vp.sy + (py / Math.max(1, canvas.height)) * vp.vh;
     return {
-        x,
-        y
+        x: Math.round(x),
+        y: Math.round(y)
     };
 }
 
 function nativeToScreen(x, y) {
-    const sx = baseW ? (canvas.width / baseW) : 1;
-    const sy = baseH ? (canvas.height / baseH) : 1;
-    return {
-        x: x * sx,
-        y: y * sy
-    };
+    const vp = viewportNative();
+    if (!vp.vw || !vp.vh) return { x: 0, y: 0 };
+    const rx = (x - vp.sx) / vp.vw;
+    const ry = (y - vp.sy) / vp.vh;
+    return { x: rx * canvas.width, y: ry * canvas.height };
 }
 
 function polyBBox(poly) {
@@ -134,8 +153,17 @@ function applySize() {
         canvas.width = initW;
         canvas.height = initH;
     }
+    // Reset zoom to fit when resizing canvas
+    resetViewToFit();
     const btn = document.getElementById('sizeBtn');
     if (btn) btn.textContent = expanded ? 'Shrink' : 'Expand';
+}
+
+function resetViewToFit() {
+    // Fit full image into the canvas area (logical zoom=1 means full frame)
+    viewZoom = 1.0;
+    viewX = 0.0;
+    viewY = 0.0;
 }
 
 async function control(action) {
@@ -342,10 +370,20 @@ canvas.addEventListener('pointerdown', (e) => {
         canvas.setPointerCapture(e.pointerId);
     } catch (err) {}
     downOnEmpty = false;
-    const {
-        x,
-        y
-    } = screenToNative(e.clientX, e.clientY);
+    // Start panning when using right/middle button or holding Space
+    if (e.button === 1 || e.button === 2 || spaceDown) {
+        isPanning = true;
+        const rect = canvas.getBoundingClientRect();
+        panStart = {
+            sx: e.clientX - rect.left,
+            sy: e.clientY - rect.top,
+            vx: viewX,
+            vy: viewY
+        };
+        e.preventDefault();
+        return;
+    }
+    const { x, y } = screenToNative(e.clientX, e.clientY);
     const isTouch = e.pointerType === 'touch';
     const hit = hitSpotAt(x, y, isTouch ? 16 : 6);
     if (hit) {
@@ -391,6 +429,22 @@ canvas.addEventListener('pointerdown', (e) => {
 });
 
 canvas.addEventListener('pointermove', (e) => {
+    if (isPanning) {
+        const rect = canvas.getBoundingClientRect();
+        const dx_px = (e.clientX - rect.left) - (panStart ? panStart.sx : 0);
+        const dy_px = (e.clientY - rect.top) - (panStart ? panStart.sy : 0);
+        // convert screen delta to native delta using current viewport size
+        const vp = viewportNative();
+        if (vp.vw && vp.vh && panStart) {
+            const dx_n = (dx_px / Math.max(1, canvas.width)) * vp.vw;
+            const dy_n = (dy_px / Math.max(1, canvas.height)) * vp.vh;
+            viewX = clamp(panStart.vx - dx_n, 0, Math.max(0, baseW - vp.vw));
+            viewY = clamp(panStart.vy - dy_n, 0, Math.max(0, baseH - vp.vh));
+            draw();
+        }
+        e.preventDefault();
+        return;
+    }
     if (!dragging) {
         updateHover(e.clientX, e.clientY);
         return;
@@ -419,11 +473,12 @@ canvas.addEventListener('pointermove', (e) => {
 function endPointer(e) {
     const wasDragging = dragging;
     const wasDownOnEmpty = downOnEmpty;
-    const {
-        x,
-        y
-    } = screenToNative(e.clientX, e.clientY);
+    const { x, y } = screenToNative(e.clientX, e.clientY);
     // Reset drag state first
+    if (isPanning) {
+        isPanning = false;
+        panStart = null;
+    }
     dragging = false;
     dragSpotId = null;
     draggingVertexIndex = null;
@@ -458,6 +513,38 @@ function endPointer(e) {
     }
     e.preventDefault();
 }
+
+// Prevent context menu on right-click to allow panning
+canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); });
+
+// Zoom with wheel (zoom towards cursor)
+canvas.addEventListener('wheel', (e) => {
+    // Natural feel: scroll up to zoom in, down to zoom out
+    const rect = canvas.getBoundingClientRect();
+    const px = e.clientX - rect.left;
+    const py = e.clientY - rect.top;
+    const before = screenToNative(e.clientX, e.clientY);
+    const factor = Math.exp(-e.deltaY * 0.0015); // smooth zoom
+    const prevZoom = viewZoom;
+    viewZoom = clamp(viewZoom * factor, 1.0, 20.0);
+    // adjust viewX/viewY so the point under cursor stays fixed
+    const vw = baseW / viewZoom;
+    const vh = baseH / viewZoom;
+    const sx = before.x - (px / Math.max(1, canvas.width)) * vw;
+    const sy = before.y - (py / Math.max(1, canvas.height)) * vh;
+    viewX = clamp(sx, 0, Math.max(0, baseW - vw));
+    viewY = clamp(sy, 0, Math.max(0, baseH - vh));
+    draw();
+    e.preventDefault();
+}, { passive: false });
+
+// Space to pan
+document.addEventListener('keydown', (e) => {
+    if (e.code === 'Space') spaceDown = true;
+});
+document.addEventListener('keyup', (e) => {
+    if (e.code === 'Space') spaceDown = false;
+});
 canvas.addEventListener('pointerup', endPointer, {
     passive: false
 });
@@ -479,7 +566,19 @@ async function draw() {
     let retries = 0;
     img.onload = () => {
         try {
-            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            // Compute view window in native coords and draw that region
+            const vp = viewportNative();
+            if (vp.vw > 0 && vp.vh > 0) {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                // source rect from native frame -> canvas
+                ctx.drawImage(
+                    img,
+                    Math.floor(vp.sx), Math.floor(vp.sy), Math.floor(vp.vw), Math.floor(vp.vh),
+                    0, 0, canvas.width, canvas.height
+                );
+            } else {
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            }
         } catch (e) {}
         // overlay spots as rectangles
         if (spots && spots.length) {
@@ -488,14 +587,14 @@ async function draw() {
             ctx.fillStyle = 'rgba(68,170,255,0.12)';
             for (const s of spots) {
                 if (!s.polygon || s.polygon.length < 4) continue;
-                const sx = baseW ? (canvas.width / baseW) : 1;
-                const sy = baseH ? (canvas.height / baseH) : 1;
-                const p0 = s.polygon[0];
+                const p0n = s.polygon[0];
+                const p0 = nativeToScreen(p0n[0], p0n[1]);
                 ctx.beginPath();
-                ctx.moveTo(p0[0] * sx, p0[1] * sy);
+                ctx.moveTo(p0.x, p0.y);
                 for (let i = 1; i < s.polygon.length; i++) {
-                    const p = s.polygon[i];
-                    ctx.lineTo(p[0] * sx, p[1] * sy);
+                    const pn = s.polygon[i];
+                    const p = nativeToScreen(pn[0], pn[1]);
+                    ctx.lineTo(p.x, p.y);
                 }
                 ctx.closePath();
                 ctx.stroke();
@@ -512,8 +611,8 @@ async function draw() {
                         ctx.save();
                         for (let i = 0; i < s.polygon.length; i++) {
                             const v = s.polygon[i];
-                            const vx = v[0] * sx,
-                                vy = v[1] * sy;
+                            const vs = nativeToScreen(v[0], v[1]);
+                            const vx = vs.x, vy = vs.y;
                             ctx.beginPath();
                             ctx.fillStyle = '#fff';
                             ctx.strokeStyle = '#ff8800';
@@ -646,15 +745,15 @@ function renderZonesView() {
     /* we keep homepage minimal; could add JSON preview if desired */
 }
 
-// Slow down frame refresh to reduce flicker while editing
-if (window.__bm_drawInt) {
-    try {
-        clearInterval(window.__bm_drawInt);
-    } catch (e) {}
+// Slow down frame refresh; default to 10s, configurable via /api/config UI_FRAME_REFRESH_MS
+function setupDrawInterval(ms) {
+    const iv = Math.max(500, parseInt(ms || 10000, 10));
+    if (window.__bm_drawInt) {
+        try { clearInterval(window.__bm_drawInt); } catch (e) {}
+    }
+    window.__bm_drawInt = setInterval(() => { draw(); }, iv);
 }
-window.__bm_drawInt = setInterval(() => {
-    draw();
-}, 1000);
+setupDrawInterval(10000);
 // Track last signature per spot for change visualization
 let lastSigMap = {};
 // Cache previous image URL per spot from aggregated API
@@ -686,50 +785,18 @@ if (window.__bm_recentInt) {
     } catch (e) {}
 }
 window.__bm_recentInt = setInterval(refreshSpotPrev, 10000);
-// Poll spot stats to detect changes and show effect
-if (window.__bm_statInt) {
-    try {
-        clearInterval(window.__bm_statInt);
-    } catch (e) {}
-}
-window.__bm_statInt = setInterval(async () => {
-    try {
-        const stats = await (await fetch('/api/spot_stats')).json();
-        const items = (stats && stats.spots) || [];
-        for (const st of items) {
-            const prev = lastSigMap[st.id] || '';
-            const cur = st.sig || '';
-            if (prev && cur && prev !== cur) {
-                try {
-                    showSpotChangeEffect(st);
-                } catch (e) {
-                    console.error(e);
-                }
-            }
-            if (cur) lastSigMap[st.id] = cur;
-            try {
-                window.lastSigMap = lastSigMap;
-            } catch (e) {}
-        }
-    } catch (e) {
-        /* ignore transient errors */
-    }
-}, 2000);
+// UI does not trigger detection; background worker handles it.
+// Removed periodic /api/spot_stats polling to avoid coupling detection to UI.
 
 function bboxToScreen(x1, y1, x2, y2) {
     if (!baseW || !baseH) return null;
-    const sx = canvas.width / baseW,
-        sy = canvas.height / baseH;
-    const rx1 = Math.round(x1 * sx),
-        ry1 = Math.round(y1 * sy);
-    const rw = Math.round((x2 - x1) * sx),
-        rh = Math.round((y2 - y1) * sy);
-    return {
-        x: rx1,
-        y: ry1,
-        w: rw,
-        h: rh
-    };
+    const p1 = nativeToScreen(x1, y1);
+    const p2 = nativeToScreen(x2, y2);
+    const rx1 = Math.round(Math.min(p1.x, p2.x));
+    const ry1 = Math.round(Math.min(p1.y, p2.y));
+    const rw = Math.round(Math.abs(p2.x - p1.x));
+    const rh = Math.round(Math.abs(p2.y - p1.y));
+    return { x: rx1, y: ry1, w: rw, h: rh };
 }
 
 function showSpotChangeEffect(st) {
@@ -929,9 +996,9 @@ async function loadEvents() {
     try {
         const limEl = document.getElementById('events_limit');
         const lim = limEl ? parseInt(limEl.value || '50', 10) : 50;
-        const j = await (await fetch(`/api/events?limit=${lim}`)).json();
-        let items = j.items || [];
         const sigOnly = !!(document.getElementById('events_sig_only') && document.getElementById('events_sig_only').checked);
+        const j = await (await fetch(`/api/events?limit=${lim}${sigOnly ? '&significant_only=1' : ''}`)).json();
+        let items = j.items || [];
         if (sigOnly) {
             items = items.filter(it => String(it.kind || '').toLowerCase() === 'spot_change' && !!(it.meta && it.meta.significant));
         }
@@ -1174,6 +1241,14 @@ async function loadPerception() {
             phash.style.display = showPhash ? 'flex' : 'none';
             rdiff.style.display = showPhash ? 'none' : 'flex';
         }
+        // Apply frame refresh interval and populate controls
+        const fr = (j && j.UI_FRAME_REFRESH_MS != null) ? parseInt(j.UI_FRAME_REFRESH_MS, 10) : 10000;
+        setupDrawInterval(fr);
+        const frEl = document.getElementById('ui_frame_refresh_ms');
+        if (frEl) frEl.value = String(fr);
+        const bw = (j && j.LLM_BURST_WINDOW_MS != null) ? parseInt(j.LLM_BURST_WINDOW_MS, 10) : 1500;
+        const bwEl = document.getElementById('llm_burst_window_ms');
+        if (bwEl) bwEl.value = String(bw);
         sel.addEventListener('change', () => {
             const v = sel.value;
             if (phash && rdiff) {
@@ -1193,6 +1268,11 @@ async function savePerception() {
         const payload = {
             DETECTOR_METHOD: dm
         };
+        // Save UI tuning
+        const fr = parseInt(document.getElementById('ui_frame_refresh_ms').value || '10000', 10);
+        if (!isNaN(fr) && fr >= 500) payload.UI_FRAME_REFRESH_MS = fr;
+        const bw = parseInt(document.getElementById('llm_burst_window_ms').value || '1500', 10);
+        if (!isNaN(bw) && bw >= 200) payload.LLM_BURST_WINDOW_MS = bw;
         const m = parseInt(document.getElementById('phash_ms').value || '1200', 10);
         if (!isFinite(m) || m < 0) {
             alert('Stable window must be a non-negative number');

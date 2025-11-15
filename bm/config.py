@@ -60,6 +60,10 @@ class Settings:
     llm_provider: str = "openrouter"
     llm_model_fast: str = "google/gemini-2.5-flash"
     llm_timeout_sec: int = 20
+    # UI tuning
+    ui_frame_refresh_ms: int = 10000
+    # LLM burst suppression window
+    llm_burst_window_ms: int = 1500
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -222,6 +226,15 @@ class Settings:
             llm_timeout_sec = int(os.getenv("LLM_TIMEOUT_SEC", "20"))
         except Exception:
             llm_timeout_sec = 20
+        # UI
+        try:
+            ui_frame_refresh_ms = max(500, int(os.getenv("UI_FRAME_REFRESH_MS", "10000")))
+        except Exception:
+            ui_frame_refresh_ms = 10000
+        try:
+            llm_burst_window_ms = max(200, int(os.getenv("LLM_BURST_WINDOW_MS", "1500")))
+        except Exception:
+            llm_burst_window_ms = 1500
 
         return cls(
             rtsp_url=rtsp_url,
@@ -269,4 +282,6 @@ class Settings:
             llm_provider=llm_provider,
             llm_model_fast=llm_model_fast,
             llm_timeout_sec=llm_timeout_sec,
+            ui_frame_refresh_ms=ui_frame_refresh_ms,
+            llm_burst_window_ms=llm_burst_window_ms,
         )

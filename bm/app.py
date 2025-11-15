@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 
 from .config import Settings
+import threading
 from .capture import VideoCaptureWorker
 from .storage import EventStore
 from .analyzer import AnalysisWorker
@@ -39,6 +40,97 @@ class AppState:
         self._last_jpg: bytes | None = None
         self._last_jpg_ts: float = 0.0
         # Previous frame-wide signature removed; we no longer suppress global-lighting changes
+        # LLM burst suppression (only send one candidate per short window)
+        self._llm_lock = threading.Lock()
+        self._llm_burst_timer: threading.Timer | None = None
+        self._llm_burst_best: dict | None = None
+        self._llm_burst_window_ms: int = int(getattr(settings, "llm_burst_window_ms", 1500) or 1500)
+        self._llm_window_started_ts: float = 0.0
+        # Background spot monitor (runs detection even when UI is closed)
+        self._mon_stop = threading.Event()
+        self._mon_thread: threading.Thread | None = None
+        self._mon_last_ts: float = 0.0
+
+    def _queue_llm_burst(self, ev_id: int, meta: dict):
+        try:
+            if not self.settings or not self.llm:
+                return
+            # compute a rough significance score
+            score = 0.0
+            try:
+                if meta.get("delta_bits") is not None:
+                    score = float(meta.get("delta_bits") or 0.0)
+                elif meta.get("changed_pixels") is not None:
+                    score = float(meta.get("changed_pixels") or 0.0)
+                elif meta.get("ratio") is not None and meta.get("roi_pixels") is not None:
+                    score = float(meta.get("ratio") or 0.0) * float(meta.get("roi_pixels") or 0.0)
+            except Exception:
+                score = 0.0
+
+            def _flush():
+                try:
+                    with self._llm_lock:
+                        best = self._llm_burst_best
+                        window_started = self._llm_window_started_ts
+                        self._llm_burst_best = None
+                        self._llm_burst_timer = None
+                        self._llm_window_started_ts = 0.0
+                    if best and self.llm:
+                        # Log which event was picked for this burst
+                        try:
+                            self.events.add(
+                                "llm_burst_pick",
+                                {
+                                    "event_id": int(best.get("ev_id")),
+                                    "score": float(best.get("score", 0.0)),
+                                    "window_started": float(window_started),
+                                    "window_ms": int(self._llm_burst_window_ms),
+                                },
+                            )
+                        except Exception:
+                            pass
+                        self.llm.queue(int(best.get("ev_id")))
+                except Exception:
+                    pass
+
+            now = time.time()
+            with self._llm_lock:
+                window_ms = int(getattr(self.settings, "roi_diff_cooldown_ms", 0) or 0)
+                # Use explicit burst window; fallback to default 1500ms
+                burst_ms = self._llm_burst_window_ms if window_ms <= 0 else min(3000, max(500, self._llm_burst_window_ms))
+                if self._llm_burst_timer is None:
+                    # start a new window and timer
+                    self._llm_burst_best = {"ev_id": int(ev_id), "score": float(score), "ts": now}
+                    self._llm_window_started_ts = now
+                    self._llm_burst_timer = threading.Timer(burst_ms / 1000.0, _flush)
+                    self._llm_burst_timer.daemon = True
+                    self._llm_burst_timer.start()
+                else:
+                    # update best if stronger candidate
+                    try:
+                        cur = float((self._llm_burst_best or {}).get("score") or 0.0)
+                    except Exception:
+                        cur = 0.0
+                    if float(score) > cur:
+                        self._llm_burst_best = {"ev_id": int(ev_id), "score": float(score), "ts": now}
+                    else:
+                        # Log suppressed candidate
+                        try:
+                            self.events.add(
+                                "llm_burst_skip",
+                                {
+                                    "event_id": int(ev_id),
+                                    "score": float(score),
+                                    "best_event_id": int((self._llm_burst_best or {}).get("ev_id") or 0),
+                                    "best_score": float((self._llm_burst_best or {}).get("score") or 0.0),
+                                    "window_started": float(self._llm_window_started_ts or now),
+                                    "window_ms": int(self._llm_burst_window_ms),
+                                },
+                            )
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
     def ensure_capture(self) -> None:
         if not self.settings.rtsp_url:
@@ -65,6 +157,58 @@ class AppState:
         except Exception:
             pass
         self.ensure_capture()
+
+    def start_monitor(self, api_spot_stats_coro) -> None:
+        """Start background monitoring loop that invokes the existing spot detection.
+
+        Pass the coroutine function object of api_spot_stats so the loop can call it
+        without duplicating detection logic.
+        """
+        if self._mon_thread and self._mon_thread.is_alive():
+            return
+        self._mon_stop.clear()
+
+        def _loop():
+            import asyncio
+            import time as _t
+
+            while not self._mon_stop.is_set():
+                try:
+                    cap = self.capture
+                    if not cap:
+                        _t.sleep(0.2)
+                        continue
+                    latest = cap.latest()
+                    if not latest:
+                        _t.sleep(0.05)
+                        continue
+                    _frame, ts = latest
+                    # Only process on new frames
+                    if ts <= self._mon_last_ts:
+                        _t.sleep(0.01)
+                        continue
+                    self._mon_last_ts = ts
+                    # Reuse the route coroutine to run detection and emit events
+                    try:
+                        asyncio.run(api_spot_stats_coro())
+                    except Exception:
+                        pass
+                except Exception:
+                    # Brief backoff on unexpected errors
+                    _t.sleep(0.1)
+
+        self._mon_thread = threading.Thread(
+            target=_loop, name="SpotMonitor", daemon=True
+        )
+        self._mon_thread.start()
+
+    def stop_monitor(self) -> None:
+        try:
+            self._mon_stop.set()
+            if self._mon_thread:
+                self._mon_thread.join(timeout=1.5)
+        except Exception:
+            pass
 
 
 def create_app() -> FastAPI:
@@ -124,6 +268,18 @@ def create_app() -> FastAPI:
                 llm = LLMWorker(state.frames_dir, state.events, cfg)
                 llm.start()
                 state.llm = llm
+        except Exception:
+            pass
+        # Start background spot monitor so detections run without UI polling
+        try:
+            state.start_monitor(api_spot_stats)
+        except Exception:
+            pass
+
+    @app.on_event("shutdown")
+    async def on_shutdown() -> None:
+        try:
+            state.stop_monitor()
         except Exception:
             pass
 
@@ -705,12 +861,10 @@ def create_app() -> FastAPI:
                                                 and thumb_path.exists()
                                             ):
                                                 meta["image_thumb"] = thumb_path.name
-                                            ev_id = state.events.add(
-                                                "spot_change", meta
-                                            )
+                                            ev_id = state.events.add("spot_change", meta)
                                             try:
                                                 if state.llm and bool(meta.get("has_prev")):
-                                                    state.llm.queue(int(ev_id))
+                                                    state._queue_llm_burst(int(ev_id), meta)
                                             except Exception:
                                                 pass
                                         except Exception:
@@ -889,7 +1043,7 @@ def create_app() -> FastAPI:
                                             ev_id = state.events.add("spot_change", meta)
                                             try:
                                                 if state.llm and bool(meta.get("has_prev")):
-                                                    state.llm.queue(int(ev_id))
+                                                    state._queue_llm_burst(int(ev_id), meta)
                                             except Exception:
                                                 pass
                                         except Exception:
@@ -1114,8 +1268,19 @@ def create_app() -> FastAPI:
 
     # Generic events API for read/edit/delete
     @app.get("/api/events", response_class=JSONResponse)
-    async def list_events(limit: int = 100):
-        return {"items": state.events.recent(int(limit))}
+    async def list_events(limit: int = 100, significant_only: bool = False):
+        items = state.events.recent(int(limit))
+        if significant_only:
+            try:
+                items = [
+                    e
+                    for e in items
+                    if str(e.get("kind", "")).lower() == "spot_change"
+                    and bool((e.get("meta") or {}).get("significant"))
+                ]
+            except Exception:
+                pass
+        return {"items": items}
 
     @app.get("/api/events/{event_id}", response_class=JSONResponse)
     async def get_event(event_id: int):
@@ -1593,6 +1758,13 @@ def create_app() -> FastAPI:
             "ROI_DIFF_COOLDOWN_MS": int(
                 getattr(settings, "roi_diff_cooldown_ms", 0) or 0
             ),
+            "UI_FRAME_REFRESH_MS": int(
+                getattr(settings, "ui_frame_refresh_ms", 10000) or 10000
+            ),
+            "LLM_BURST_WINDOW_MS": int(
+                getattr(settings, "llm_burst_window_ms", 1500) or 1500
+            ),
+            "UI_FRAME_REFRESH_MS": int(getattr(settings, "ui_frame_refresh_ms", 10000) or 10000),
             # category defaults
             "CATEGORY_GATE_STABLE_MS": int(settings.category_gate_stable_ms or 0),
             "CATEGORY_GATE_PHASH_MIN_BITS": int(
@@ -1645,6 +1817,9 @@ def create_app() -> FastAPI:
         _opt_set_float("ROI_DIFF_THRESHOLD", "roi_diff_threshold")
         _opt_set_int("ROI_DIFF_MIN_PIXELS", "roi_diff_min_pixels")
         _opt_set_int("ROI_DIFF_COOLDOWN_MS", "roi_diff_cooldown_ms")
+        _opt_set_int("UI_FRAME_REFRESH_MS", "ui_frame_refresh_ms")
+        _opt_set_int("LLM_BURST_WINDOW_MS", "llm_burst_window_ms")
+        _opt_set_int("UI_FRAME_REFRESH_MS", "ui_frame_refresh_ms")
         # Category defaults
         _opt_set_int("CATEGORY_GATE_STABLE_MS", "category_gate_stable_ms")
         _opt_set_int("CATEGORY_GATE_PHASH_MIN_BITS", "category_gate_phash_min_bits")
@@ -1679,6 +1854,15 @@ def create_app() -> FastAPI:
                 ),
                 "ROI_DIFF_COOLDOWN_MS": str(
                     int(getattr(settings, "roi_diff_cooldown_ms", 0) or 0)
+                ),
+                "UI_FRAME_REFRESH_MS": str(
+                    int(getattr(settings, "ui_frame_refresh_ms", 10000) or 10000)
+                ),
+                "LLM_BURST_WINDOW_MS": str(
+                    int(getattr(settings, "llm_burst_window_ms", 1500) or 1500)
+                ),
+                "UI_FRAME_REFRESH_MS": str(
+                    int(getattr(settings, "ui_frame_refresh_ms", 10000) or 10000)
                 ),
                 "CATEGORY_GATE_STABLE_MS": str(
                     int(settings.category_gate_stable_ms or 0)

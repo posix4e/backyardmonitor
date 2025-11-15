@@ -132,7 +132,7 @@
                      min="1"
                      style="width:70px" />
               <label class="muted" title="Only show events marked significant by LLM">
-                <input type="checkbox" id="events_sig_only" />
+                <input type="checkbox" id="events_sig_only" checked />
                 Significant only
               </label>
               <button style="margin-left:auto; color:#a00;" onclick="clearAllEvents()">
@@ -178,6 +178,14 @@
                 <option value="roi_diff">ROI Diff</option>
               </select>
               <span class="muted">Configure thresholds below</span>
+            </div>
+            <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:6px;">
+              <label for="ui_frame_refresh_ms">Live frame refresh (ms)</label>
+              <input type="number" id="ui_frame_refresh_ms" name="ui_frame_refresh_ms" value="10000" min="500" step="500" style="width:120px" />
+              <label for="llm_burst_window_ms" title="Only the strongest event is sent to LLM within this window">
+                LLM burst window (ms)
+              </label>
+              <input type="number" id="llm_burst_window_ms" name="llm_burst_window_ms" value="1500" min="200" step="100" style="width:120px" />
             </div>
             <div id="phash_params"
                  style="display:flex;
@@ -264,7 +272,7 @@
               <button onclick="cleanupOrphans()">Cleanup Orphans</button>
               <button onclick="loadThumbnails()">Show Latest Thumbnails</button>
               <label class="muted" title="Only show LLM-significant changes">
-                <input type="checkbox" id="thumb_sig_only" />
+                <input type="checkbox" id="thumb_sig_only" checked />
                 Significant only
               </label>
             </div>
