@@ -2009,27 +2009,68 @@ def create_app() -> FastAPI:
     async def spot_history(
         spot_id: str, limit: int = 8, significant_only: bool = False
     ):
-        evs = state.events.spot_events(spot_id, limit)
-        if significant_only:
+        lim = max(1, int(limit))
+        # Helper to compute significance with fallback to delta_bits threshold
+        def _is_significant(e: dict) -> bool:
+            meta = e.get("meta") or {}
+            if bool(meta.get("significant")):
+                return True
             try:
-                evs = [e for e in evs if bool((e.get("meta") or {}).get("significant"))]
+                dbits = int(meta.get("delta_bits") or 0)
+            except Exception:
+                return False
+            # Determine min_bits using category defaults and per-spot overrides
+            mb = int(state.settings.phash_min_bits or 0)
+            try:
+                z = load_zones(state.zones_path)
+                sp = next((s for s in z.spots if s.id == spot_id), None)
+                if sp:
+                    cat = (getattr(sp, "category", None) or "").strip().lower()
+                    if cat == "gate":
+                        mb = int(state.settings.category_gate_phash_min_bits or mb)
+                    elif cat in ("spot", "parking"):
+                        mb = int(state.settings.category_parking_phash_min_bits or mb)
+                    if getattr(sp, "min_bits", None) is not None:
+                        mb = int(sp.min_bits)  # type: ignore[attr-defined]
             except Exception:
                 pass
-        out = []
-        for e in evs:
-            out.append(
-                {
-                    "id": e["id"],
-                    "ts": e["ts"],
-                    "spot_id": spot_id,
-                    "thumb": f"/api/event_image?id={e['id']}&kind=thumb",
-                    "full": f"/api/event_image?id={e['id']}&kind=full",
-                    "crop": f"/api/event_image?id={e['id']}&kind=crop",
-                    "significant": bool(
-                        ((e.get("meta") or {}).get("significant")) or False
-                    ),
-                }
-            )
+            return dbits >= (mb + 2)
+
+        def _to_item(e: dict) -> dict:
+            meta = e.get("meta") or {}
+            return {
+                "id": e["id"],
+                "ts": e["ts"],
+                "spot_id": spot_id,
+                "thumb": f"/api/event_image?id={e['id']}&kind=thumb",
+                "full": f"/api/event_image?id={e['id']}&kind=full",
+                "crop": f"/api/event_image?id={e['id']}&kind=crop",
+                "significant": bool(meta.get("significant") or False),
+            }
+
+        if significant_only:
+            # Scan newest-first across all events and collect for this spot after filtering
+            items: list[dict] = []
+            try:
+                for e in reversed(state.events.all()):
+                    if str(e.get("kind", "")).lower() != "spot_change":
+                        continue
+                    meta = e.get("meta") or {}
+                    if str(meta.get("spot_id") or "") != str(spot_id):
+                        continue
+                    if not _is_significant(e):
+                        continue
+                    items.append(_to_item(e))
+                    if len(items) >= lim:
+                        break
+                return {"items": items}
+            except Exception:
+                # fall back to simple path
+                pass
+
+        # Default: fast path limited query per spot
+        evs = state.events.spot_events(spot_id, lim)
+        out = [_to_item(e) for e in evs]
         return {"items": out}
 
     return app
