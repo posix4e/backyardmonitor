@@ -65,6 +65,11 @@ async function load() {
   }
   const prov = document.getElementById('prov');
   if (prov) prov.textContent = `${meta.llm_provider || ''} / ${meta.llm_model || ''}`;
+  // Prefill provider/model controls
+  const provSel = document.getElementById('llm_provider');
+  if (provSel && meta.llm_provider) provSel.value = String(meta.llm_provider);
+  const modelInp = document.getElementById('llm_model');
+  if (modelInp && meta.llm_model) modelInp.value = String(meta.llm_model);
   const reason = document.getElementById('reason');
   if (reason) reason.textContent = meta.llm_reason || meta.llm_error || '';
   const prompt = document.getElementById('prompt');
@@ -128,7 +133,12 @@ async function load() {
     btn.addEventListener('click', async () => {
       try {
         statusEl.textContent = 'Queuing analysis…';
-        const r = await fetch(`/api/llm/queue_event?id=${encodeURIComponent(String(id))}`, { method: 'POST' });
+        const provider = document.getElementById('llm_provider') ? document.getElementById('llm_provider').value : '';
+        const model = document.getElementById('llm_model') ? document.getElementById('llm_model').value : '';
+        const params = new URLSearchParams({ id: String(id) });
+        if (provider) params.set('provider', provider);
+        if (model) params.set('model', model);
+        const r = await fetch(`/api/llm/queue_event?${params.toString()}`, { method: 'POST' });
         if (!r.ok) {
           statusEl.textContent = 'Queue failed';
           return;

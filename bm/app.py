@@ -1766,17 +1766,17 @@ def create_app() -> FastAPI:
         return {"ok": True, "queued_event_id": int(ev["id"])}
 
     @app.post("/api/llm/queue_event", response_class=JSONResponse)
-    async def llm_queue_event(id: int):
+    async def llm_queue_event(id: int, provider: str | None = None, model: str | None = None):
         ev = state.events.get(int(id))
         if not ev or str(ev.get("kind", "")).lower() != "spot_change":
             raise HTTPException(404, "spot_change event not found")
         if not state.llm:
             raise HTTPException(503, "LLM worker not running")
         try:
-            state.llm.queue(int(id))
+            state.llm.queue(int(id), provider=provider, model=model)
         except Exception:
             raise HTTPException(500, "Failed to enqueue")
-        return {"ok": True, "queued_event_id": int(id)}
+        return {"ok": True, "queued_event_id": int(id), "provider": provider, "model": model}
 
     # Comparison baseline helpers
     @app.get("/api/compare/baseline", response_class=JSONResponse)

@@ -59,7 +59,14 @@
       <div id="analysis" class="kv"></div>
     </div>
     <div class="card" style="margin-top:12px;">
-      <div style="display:flex; gap:8px; align-items:center;">
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+        <div class="muted">Provider</div>
+        <select id="llm_provider">
+          <option value="openrouter">openrouter</option>
+          <option value="openai">openai</option>
+        </select>
+        <div class="muted">Model</div>
+        <input id="llm_model" type="text" value="google/gemini-2.5-flash" style="min-width:260px;" />
         <button id="btn_rerun">Re-run analysis</button>
         <span class="muted" id="run_status"></span>
       </div>

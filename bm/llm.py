@@ -50,7 +50,7 @@ class LLMWorker:
             except Exception:
                 pass
 
-    def queue(self, event_id: int):
+    def queue(self, event_id: int, provider: Optional[str] = None, model: Optional[str] = None):
         try:
             # Create a lightweight investigation-started event
             try:
@@ -60,7 +60,12 @@ class LLMWorker:
                 )
             except Exception:
                 pass
-            self._q.put_nowait(int(event_id))
+            item = {"id": int(event_id)}
+            if provider:
+                item["provider"] = str(provider)
+            if model:
+                item["model"] = str(model)
+            self._q.put_nowait(item)
         except Exception:
             pass
 
@@ -68,10 +73,13 @@ class LLMWorker:
         while not self._stop.is_set():
             try:
                 try:
-                    ev_id = self._q.get(timeout=0.5)
+                    ev_item = self._q.get(timeout=0.5)
                 except Empty:
                     continue
-                self._handle(ev_id)
+                if isinstance(ev_item, dict):
+                    self._handle(ev_item.get("id"), override_provider=ev_item.get("provider"), override_model=ev_item.get("model"))
+                else:
+                    self._handle(ev_item)
             except Exception:
                 # Swallow and continue
                 pass
@@ -115,7 +123,7 @@ class LLMWorker:
             return None
         return None
 
-    def _handle(self, event_id: int):
+    def _handle(self, event_id: int, override_provider: Optional[str] = None, override_model: Optional[str] = None):
         import logging
 
         log = logging.getLogger("uvicorn.error")
@@ -141,8 +149,8 @@ class LLMWorker:
         )
         significant = False
         reason = ""
-        provider = (self.cfg.provider or "openai").strip().lower()
-        model = self.cfg.model_fast or "gpt-4o-mini"
+        provider = (override_provider or self.cfg.provider or "openrouter").strip().lower()
+        model = (override_model or self.cfg.model_fast or "google/gemini-2.5-flash")
         txt = ""
         error_msg: Optional[str] = None
         # Try provider; gracefully skip if client not available
