@@ -952,7 +952,7 @@ refresh();
         try{
           if (!confirm('Delete all events? This cannot be undone.')) return;
           let bulk = false;
-          try { const r = await fetch('/api/events/clear', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({}) }); bulk = r.ok; } catch(e){}
+          try { const r = await fetch('/api/events/clear_all', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({}) }); bulk = r.ok; } catch(e){}
           if (!bulk){
             const j = await (await fetch('/api/events?limit=10000')).json();
             const ids = (j.items||[]).map(it=>it.id);

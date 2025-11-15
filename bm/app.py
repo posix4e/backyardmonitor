@@ -479,7 +479,7 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "Event not found")
         return {"ok": True}
 
-    @app.post("/api/events/clear", response_class=JSONResponse)
+    @app.post("/api/events/clear_all", response_class=JSONResponse)
     async def clear_events():
         # Remove all referenced images first, then clear DB
         try:

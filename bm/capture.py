@@ -71,7 +71,16 @@ class VideoCaptureWorker:
                 rtsp_transport = os.getenv("RTSP_TRANSPORT", "tcp").lower()
                 # Apply FFmpeg capture options: transport + a sane socket timeout.
                 # stimeout is in microseconds; here ~5s.
-                opts = f"rtsp_transport;{rtsp_transport}|stimeout;5000000"
+                # Additional FFmpeg opts to reduce latency and avoid grey frames after stalls
+                # - fflags=nobuffer, flags=low_delay, reorder_queue_size=0, max_delay ~0.5s
+                # - small probesize/analyzeduration to start decoding fast
+                # - rw_timeout/stimeout socket timeouts
+                # - use_wallclock_as_timestamps=1 to progress timestamps
+                opts = (
+                    f"rtsp_transport;{rtsp_transport}"
+                    "|fflags;nobuffer|flags;low_delay|reorder_queue_size;0|max_delay;500000"
+                    "|probesize;32768|analyzeduration;0|rw_timeout;5000000|stimeout;5000000|use_wallclock_as_timestamps;1"
+                )
                 # Avoid clobbering unrelated options if user already set them; merge best-effort.
                 existing = os.getenv("OPENCV_FFMPEG_CAPTURE_OPTIONS")
                 if existing and existing != opts:
