@@ -1224,6 +1224,7 @@ async function loadPerception() {
         const rdiff = document.getElementById('roidiff_params');
         const b = document.getElementById('phash_bits');
         const m = document.getElementById('phash_ms');
+        const m2 = document.getElementById('roi_stable_ms');
         const rd_t = document.getElementById('roi_diff_threshold');
         const rd_a = document.getElementById('roi_diff_alpha');
         const rd_min = document.getElementById('roi_diff_min_pixels');
@@ -1231,7 +1232,9 @@ async function loadPerception() {
         const dm = (j.DETECTOR_METHOD || 'phash');
         if (sel) sel.value = dm;
         if (b) b.value = j.PHASH_MIN_BITS != null ? j.PHASH_MIN_BITS : 14;
-        if (m) m.value = j.PHASH_STABLE_MS != null ? j.PHASH_STABLE_MS : 1200;
+        const stable = j.PHASH_STABLE_MS != null ? j.PHASH_STABLE_MS : 1200;
+        if (m) m.value = stable;
+        if (m2) m2.value = stable;
         if (rd_t) rd_t.value = j.ROI_DIFF_THRESHOLD != null ? j.ROI_DIFF_THRESHOLD : 0.02;
         if (rd_a) rd_a.value = j.ROI_DIFF_ALPHA != null ? j.ROI_DIFF_ALPHA : 0.05;
         if (rd_min) rd_min.value = j.ROI_DIFF_MIN_PIXELS != null ? j.ROI_DIFF_MIN_PIXELS : 600;
@@ -1273,7 +1276,9 @@ async function savePerception() {
         if (!isNaN(fr) && fr >= 500) payload.UI_FRAME_REFRESH_MS = fr;
         const bw = parseInt(document.getElementById('llm_burst_window_ms').value || '1500', 10);
         if (!isNaN(bw) && bw >= 200) payload.LLM_BURST_WINDOW_MS = bw;
-        const m = parseInt(document.getElementById('phash_ms').value || '1200', 10);
+        // Read stable window from the visible control
+        const mEl = (dm === 'phash') ? document.getElementById('phash_ms') : document.getElementById('roi_stable_ms');
+        const m = parseInt((mEl && mEl.value) ? mEl.value : '1200', 10);
         if (!isFinite(m) || m < 0) {
             alert('Stable window must be a non-negative number');
             return;
